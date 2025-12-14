@@ -263,7 +263,11 @@ def setup_trading_node() -> TradingNodeConfig:
     logging_config = LoggingConfig(
         log_level=log_level,
         log_level_file=log_level,
+        log_directory="logs",
+        log_file_name="deepseek_trader",
         log_file_format="json",
+        log_colors=True,
+        bypass_logging=False,
     )
 
     # Trading node config
