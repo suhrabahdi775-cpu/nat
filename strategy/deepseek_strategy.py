@@ -1244,7 +1244,7 @@ class DeepSeekAIStrategy(Strategy):
         # PositionOpened event contains position data directly
         self.log.info(
             f"🔴 Position closed: {event.side.name} "
-            f"P&L: {event.realized_pnl:.2f} USDT"
+            f"P&L: {float(event.realized_pnl):.2f} USDT"
         )
         
         # Clear trailing stop state
