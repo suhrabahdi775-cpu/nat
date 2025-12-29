@@ -155,8 +155,8 @@ class TechnicalIndicatorManager:
         # EMA values
         ema_values = {f'ema_{period}': self.emas[period].value for period in self.ema_periods}
 
-        # RSI
-        rsi_value = self.rsi.value
+        # RSI (convert from 0-1 scale to 0-100 scale)
+        rsi_value = self.rsi.value * 100
 
         # MACD
         macd_value = self.macd.value
