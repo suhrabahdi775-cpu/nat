@@ -28,6 +28,7 @@ class DeepSeekAnalyzer:
         temperature: float = 0.1,
         base_url: str = "https://api.deepseek.com",
         max_retries: int = 2,
+        nautilus_logger=None,
     ):
         """
         Initialize DeepSeek analyzer.
@@ -44,17 +45,46 @@ class DeepSeekAnalyzer:
             API base URL
         max_retries : int
             Maximum retry attempts on failure
+        nautilus_logger : optional
+            NautilusTrader logger instance (self.log from Strategy) to route
+            errors/warnings into the JSON log file. Falls back to standard
+            Python logging if not provided.
         """
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
         self.temperature = temperature
         self.max_retries = max_retries
 
-        # Setup logger
+        # Use NautilusTrader logger if provided, otherwise fall back to stdlib
+        self._nautilus_log = nautilus_logger
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
 
         # Track signal history
         self.signal_history = []
+
+    def _log_info(self, msg: str):
+        if self._nautilus_log:
+            self._nautilus_log.info(msg)
+        else:
+            self.logger.info(msg)
+
+    def _log_warning(self, msg: str):
+        if self._nautilus_log:
+            self._nautilus_log.warning(msg)
+        else:
+            self.logger.warning(msg)
+
+    def _log_error(self, msg: str):
+        if self._nautilus_log:
+            self._nautilus_log.error(msg)
+        else:
+            self.logger.error(msg)
+
+    def _log_debug(self, msg: str):
+        if self._nautilus_log:
+            self._nautilus_log.debug(msg)
+        else:
+            self.logger.debug(msg)
 
     def analyze(
         self,
@@ -99,10 +129,10 @@ class DeepSeekAnalyzer:
                 if signal and not signal.get("is_fallback", False):
                     return signal
 
-                self.logger.warning(f"⚠️ Attempt {attempt + 1} failed, retrying...")
+                self._log_warning(f"⚠️ Attempt {attempt + 1} returned fallback, retrying...")
 
             except Exception as e:
-                self.logger.error(f"❌ Analysis attempt {attempt + 1} failed: {e}")
+                self._log_error(f"❌ Analysis attempt {attempt + 1} failed: {type(e).__name__}: {e}")
                 if attempt == self.max_retries - 1:
                     return self._create_fallback_signal(price_data)
 
@@ -145,19 +175,21 @@ class DeepSeekAnalyzer:
 
         # Parse response
         result = response.choices[0].message.content
-        self.logger.info(f"🤖 DeepSeek Response: {result}")
+        self._log_info(f"🤖 DeepSeek Raw Response: {result[:500]}")
 
         signal_data = self._safe_parse_json(result)
 
         if signal_data is None:
+            self._log_error(f"❌ JSON parse failed for response: {result[:200]}")
             return self._create_fallback_signal(price_data)
 
         # Validate required fields
         required_fields = ["signal", "reason", "stop_loss", "take_profit", "confidence"]
         optional_fields = ["trend_strength", "risk_assessment"]
-        
+
         if not all(field in signal_data for field in required_fields):
-            self.logger.warning(f"⚠️ Missing required fields in signal data")
+            missing = [f for f in required_fields if f not in signal_data]
+            self._log_warning(f"⚠️ Missing required fields in signal data: {missing}")
             return self._create_fallback_signal(price_data)
         
         # Set defaults for optional fields if missing
@@ -548,10 +580,10 @@ Remember: Be decisive but not reckless. Quality over quantity.
                     # Try parsing
                     return json.loads(json_str)
                 except json.JSONDecodeError as e:
-                    self.logger.error(f"❌ JSON parse failed: {e}")
-                    self.logger.debug(f"Original content: {json_str_original[:500]}...")
+                    self._log_error(f"❌ JSON parse failed: {e}")
+                    self._log_debug(f"Original content: {json_str_original[:500]}...")
                 except Exception as e:
-                    self.logger.error(f"❌ JSON fix error: {e}")
+                    self._log_error(f"❌ JSON fix error: {e}")
 
             return None
 
@@ -573,10 +605,10 @@ Remember: Be decisive but not reckless. Quality over quantity.
         signal_count = sum(1 for s in self.signal_history if s.get('signal') == signal)
         total = len(self.signal_history)
 
-        self.logger.debug(f"📊 Signal Stats: {signal} (appeared {signal_count}/{total} times in recent history)")
+        self._log_debug(f"📊 Signal Stats: {signal} (appeared {signal_count}/{total} times in recent history)")
 
         # Check for consecutive same signals
         if len(self.signal_history) >= 3:
             last_three = [s['signal'] for s in self.signal_history[-3:]]
             if len(set(last_three)) == 1:
-                self.logger.warning(f"⚠️ Warning: 3 consecutive {signal} signals")
+                self._log_warning(f"⚠️ Warning: 3 consecutive {signal} signals")

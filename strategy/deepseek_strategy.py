@@ -228,6 +228,7 @@ class DeepSeekAIStrategy(Strategy):
             model=config.deepseek_model,
             temperature=config.deepseek_temperature,
             max_retries=config.deepseek_max_retries,
+            nautilus_logger=self.log,
         )
         
         # Telegram Bot
@@ -600,16 +601,20 @@ class DeepSeekAIStrategy(Strategy):
 
         # Analyze with DeepSeek AI
         try:
+            import time as _time
             self.log.info("Calling DeepSeek AI for analysis...")
+            _t0 = _time.monotonic()
             signal_data = self.deepseek.analyze(
                 price_data=price_data,
                 technical_data=technical_data,
                 sentiment_data=sentiment_data,
                 current_position=current_position,
             )
+            _elapsed = _time.monotonic() - _t0
             self.log.info(
                 f"🤖 Signal: {signal_data['signal']} | "
                 f"Confidence: {signal_data['confidence']} | "
+                f"API time: {_elapsed:.1f}s | "
                 f"Reason: {signal_data['reason']}"
             )
             
@@ -1494,6 +1499,7 @@ class DeepSeekAIStrategy(Strategy):
                 quantity=self.instrument.make_qty(quantity),
                 trigger_price=self.instrument.make_price(new_sl_price),
                 trigger_type=TriggerType.LAST_PRICE,
+                emulation_trigger=TriggerType.LAST_PRICE,  # Emulate locally, not native STOP_MARKET
                 reduce_only=True,
             )
             self.submit_order(new_sl_order)
