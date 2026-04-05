@@ -165,7 +165,7 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
 
         # AI
         deepseek_api_key=deepseek_api_key,
-        deepseek_model="deepseek-chat",
+        deepseek_model="deepseek-reasoner",
         deepseek_temperature=0.1,
         deepseek_max_retries=2,
 
