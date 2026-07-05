@@ -7,6 +7,7 @@ position updates, and system status via Telegram.
 
 import asyncio
 import logging
+import threading
 from typing import Optional, Dict, Any
 from datetime import datetime
 
@@ -64,7 +65,16 @@ class TelegramBot:
         self.chat_id = chat_id
         self.logger = logger or logging.getLogger(__name__)
         self.enabled = enabled
-        
+
+        # Dedicated event loop and thread for all Telegram I/O
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever,
+            name="telegram-io",
+            daemon=True
+        )
+        self._thread.start()
+
         # Initialize bot
         try:
             self.bot = Bot(token=token)
@@ -138,40 +148,19 @@ class TelegramBot:
         """
         Synchronous wrapper for send_message.
 
-        Creates an event loop if needed and sends the message.
-        Useful for calling from non-async contexts.
+        Submits the coroutine to the dedicated background event loop so the
+        same loop (and its underlying connection pool) is reused for every
+        message, avoiding pool-exhaustion errors.
         """
         try:
-            # Always create a new event loop for thread safety
-            # This avoids "no event loop in thread" errors
-            import threading
-            current_thread = threading.current_thread()
-
-            # Check if we're in the main thread with a running loop
-            try:
-                loop = asyncio.get_running_loop()
-                # We're in an async context, but send_message_sync should still work
-                # We need to run in a new thread to avoid blocking
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(self._run_sync_in_new_loop, message, kwargs)
-                    return future.result(timeout=10)
-            except RuntimeError:
-                # No running loop - create a new one
-                return self._run_sync_in_new_loop(message, kwargs)
+            future = asyncio.run_coroutine_threadsafe(
+                self.send_message(message, **kwargs),
+                self._loop
+            )
+            return future.result(timeout=15)
         except Exception as e:
             self.logger.error(f"❌ Error in send_message_sync: {e}")
             return False
-
-    def _run_sync_in_new_loop(self, message: str, kwargs: dict) -> bool:
-        """Helper to run async code in a new event loop."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(self.send_message(message, **kwargs))
-        finally:
-            loop.close()
-            # Don't set event loop to None - it might interfere with other threads
     
     # Message Formatters
     

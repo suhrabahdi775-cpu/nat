@@ -1382,7 +1382,7 @@ class DeepSeekAIStrategy(Strategy):
                         price_move_pct = (new_sl_price - current_sl_price) / current_sl_price
                         should_update = price_move_pct >= self.trailing_update_threshold_pct
                     
-                    if should_update and new_sl_price > current_sl_price:
+                    if should_update and (current_sl_price is None or new_sl_price > current_sl_price):
                         self._execute_trailing_stop_update(
                             instrument_key=instrument_key,
                             new_sl_price=new_sl_price,
@@ -1421,7 +1421,7 @@ class DeepSeekAIStrategy(Strategy):
                         price_move_pct = (current_sl_price - new_sl_price) / current_sl_price
                         should_update = price_move_pct >= self.trailing_update_threshold_pct
                     
-                    if should_update and new_sl_price < current_sl_price:
+                    if should_update and (current_sl_price is None or new_sl_price < current_sl_price):
                         self._execute_trailing_stop_update(
                             instrument_key=instrument_key,
                             new_sl_price=new_sl_price,
