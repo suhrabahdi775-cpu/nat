@@ -24,7 +24,7 @@ class DeepSeekAnalyzer:
     def __init__(
         self,
         api_key: str,
-        model: str = "deepseek-chat",
+        model: str = "deepseek-v4-pro",
         temperature: float = 0.1,
         base_url: str = "https://api.deepseek.com",
         max_retries: int = 2,
@@ -38,7 +38,7 @@ class DeepSeekAnalyzer:
         api_key : str
             DeepSeek API key
         model : str
-            Model name (default: deepseek-chat)
+            Model name (default: deepseek-v4-pro)
         temperature : float
             Temperature for response generation (0.0-1.0)
         base_url : str

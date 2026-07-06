@@ -165,7 +165,7 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
 
         # AI
         deepseek_api_key=deepseek_api_key,
-        deepseek_model="deepseek-reasoner",
+        deepseek_model="deepseek-v4-pro",
         deepseek_temperature=0.1,
         deepseek_max_retries=2,
 
@@ -221,7 +221,6 @@ def get_binance_config() -> tuple:
         api_key=api_key,
         api_secret=api_secret,
         account_type=BinanceAccountType.USDT_FUTURES,  # Binance Futures
-        testnet=False,  # Set to True for testnet
         instrument_provider=InstrumentProviderConfig(load_all=True),
     )
 
@@ -230,7 +229,6 @@ def get_binance_config() -> tuple:
         api_key=api_key,
         api_secret=api_secret,
         account_type=BinanceAccountType.USDT_FUTURES,
-        testnet=False,
         instrument_provider=InstrumentProviderConfig(load_all=True),
     )
 

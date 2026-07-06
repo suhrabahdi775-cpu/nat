@@ -60,7 +60,7 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
 
     # AI configuration
     deepseek_api_key: str = ""
-    deepseek_model: str = "deepseek-reasoner"
+    deepseek_model: str = "deepseek-v4-pro"
     deepseek_temperature: float = 0.1
     deepseek_max_retries: int = 2
 
