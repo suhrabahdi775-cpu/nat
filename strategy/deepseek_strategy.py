@@ -162,6 +162,11 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     # Analyzer: rule-based (deterministic, no API) for backtesting
     use_rule_based_analyzer: bool = False
 
+    # Cached DeepSeek mode (backtests): real API signals recorded to this
+    # file, replayed deterministically on later runs. Empty = live client.
+    deepseek_cache_file: str = ""
+    deepseek_max_api_calls: int = 0  # cap per run; 0 = unlimited
+
     # Pre-fetch history via REST on start (disable for backtesting)
     prefetch_bars: bool = True
 
@@ -391,10 +396,25 @@ class DeepSeekAIStrategy(Strategy):
             atr_period=config.atr_period,
         )
 
-        # Analyzer: DeepSeek AI, or deterministic rule-based (for backtesting)
+        # Analyzer: rule-based (offline), cached DeepSeek (backtest
+        # measurement), or live DeepSeek
         if config.use_rule_based_analyzer:
             from utils.rule_based_analyzer import RuleBasedAnalyzer
             self.deepseek = RuleBasedAnalyzer()
+        elif config.deepseek_cache_file:
+            from utils.cached_analyzer import CachedDeepSeekAnalyzer
+            api_key = config.deepseek_api_key or os.getenv('DEEPSEEK_API_KEY')
+            if not api_key:
+                raise ValueError("DeepSeek API key not provided")
+            self.deepseek = CachedDeepSeekAnalyzer(
+                api_key=api_key,
+                cache_path=config.deepseek_cache_file,
+                model=config.deepseek_model,
+                temperature=config.deepseek_temperature,
+                max_retries=config.deepseek_max_retries,
+                max_api_calls=config.deepseek_max_api_calls,
+                nautilus_logger=self.log,
+            )
         else:
             api_key = config.deepseek_api_key or os.getenv('DEEPSEEK_API_KEY')
             if not api_key:
