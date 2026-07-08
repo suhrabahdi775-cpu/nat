@@ -92,6 +92,8 @@ class DeepSeekAnalyzer:
         technical_data: Dict[str, Any],
         sentiment_data: Optional[Dict[str, Any]] = None,
         current_position: Optional[Dict[str, Any]] = None,
+        trade_history: Optional[list] = None,
+        funding_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Analyze market conditions and generate trading signal.
@@ -106,6 +108,10 @@ class DeepSeekAnalyzer:
             Market sentiment data
         current_position : Dict, optional
             Current position information
+        trade_history : list, optional
+            Recent closed-trade outcomes (feedback loop)
+        funding_data : Dict, optional
+            Current perp funding rate context
 
         Returns
         -------
@@ -115,15 +121,14 @@ class DeepSeekAnalyzer:
                 "signal": "BUY|SELL|HOLD",
                 "confidence": "HIGH|MEDIUM|LOW",
                 "reason": str,
-                "stop_loss": float,
-                "take_profit": float,
                 "timestamp": str
             }
         """
         for attempt in range(self.max_retries):
             try:
                 signal = self._analyze_with_retry(
-                    price_data, technical_data, sentiment_data, current_position
+                    price_data, technical_data, sentiment_data, current_position,
+                    trade_history, funding_data,
                 )
 
                 if signal and not signal.get("is_fallback", False):
@@ -144,34 +149,52 @@ class DeepSeekAnalyzer:
         technical_data: Dict[str, Any],
         sentiment_data: Optional[Dict[str, Any]],
         current_position: Optional[Dict[str, Any]],
+        trade_history: Optional[list] = None,
+        funding_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Internal analysis with single attempt."""
 
         # Build comprehensive prompt
         prompt = self._build_analysis_prompt(
-            price_data, technical_data, sentiment_data, current_position
+            price_data, technical_data, sentiment_data, current_position,
+            trade_history, funding_data,
         )
 
-        # Call DeepSeek API
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an elite algorithmic trading system specializing in "
-                        "high-frequency cryptocurrency trading on Binance Futures (BTCUSDT-PERP). "
-                        "You analyze 15-minute K-line data with precision, combining multiple "
-                        "technical indicators, market microstructure, and sentiment analysis. "
-                        "Your decisions must be data-driven, risk-aware, and optimized for "
-                        "15-minute timeframe characteristics. Always return responses strictly in JSON format."
-                    )
-                },
-                {"role": "user", "content": prompt}
-            ],
-            stream=False,
-            temperature=self.temperature
-        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an elite algorithmic trading system specializing in "
+                    "high-frequency cryptocurrency trading on Binance Futures (BTCUSDT-PERP). "
+                    "You analyze 15-minute K-line data with precision, combining multiple "
+                    "technical indicators, market microstructure, and sentiment analysis. "
+                    "Your decisions must be data-driven, risk-aware, and optimized for "
+                    "15-minute timeframe characteristics. Always return responses strictly in JSON format."
+                )
+            },
+            {"role": "user", "content": prompt}
+        ]
+
+        # Call DeepSeek API - prefer native JSON mode (guaranteed valid JSON),
+        # falling back to a plain call for models/endpoints without support.
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                stream=False,
+                temperature=self.temperature,
+                response_format={"type": "json_object"},
+            )
+        except Exception as e:
+            self._log_warning(
+                f"⚠️ JSON mode unavailable ({type(e).__name__}), retrying plain: {e}"
+            )
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                stream=False,
+                temperature=self.temperature,
+            )
 
         # Parse response
         result = response.choices[0].message.content
@@ -184,7 +207,9 @@ class DeepSeekAnalyzer:
             return self._create_fallback_signal(price_data)
 
         # Validate required fields
-        required_fields = ["signal", "reason", "stop_loss", "take_profit", "confidence"]
+        # (stop_loss/take_profit removed: the strategy computes ATR-based
+        # SL/TP itself and never used the AI's values)
+        required_fields = ["signal", "reason", "confidence"]
         optional_fields = ["trend_strength", "risk_assessment"]
 
         if not all(field in signal_data for field in required_fields):
@@ -217,6 +242,8 @@ class DeepSeekAnalyzer:
         technical_data: Dict[str, Any],
         sentiment_data: Optional[Dict[str, Any]],
         current_position: Optional[Dict[str, Any]],
+        trade_history: Optional[list] = None,
+        funding_data: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Build comprehensive analysis prompt for DeepSeek."""
 
@@ -231,6 +258,12 @@ class DeepSeekAnalyzer:
 
         # Position info
         position_text = self._format_position_data(current_position)
+
+        # Recent trade outcomes (feedback loop - learn from results)
+        history_text = self._format_trade_history(trade_history)
+
+        # Funding rate context
+        funding_text = self._format_funding_data(funding_data)
 
         # Previous signal
         signal_text = ""
@@ -254,6 +287,10 @@ class DeepSeekAnalyzer:
 {technical_text}
 
 {sentiment_text}
+
+{funding_text}
+
+{history_text}
 
 {signal_text}
 
@@ -304,7 +341,7 @@ Tertiary Layer (10% weight) - RISK MANAGEMENT:
 
 【2. SIGNAL GENERATION LOGIC - STRICT RULES】
 
-BUY Signal Conditions (Require at least 2 of 3):
+BUY Signal Conditions (Require at least 3 of the 6 conditions below):
 ├─ ✅ Strong uptrend confirmed by MA alignment
 ├─ ✅ Price breaks above resistance with volume surge
 ├─ ✅ RSI recovering from oversold (< 40) or healthy momentum (40-60)
@@ -312,7 +349,7 @@ BUY Signal Conditions (Require at least 2 of 3):
 ├─ ✅ Bullish K-line pattern (hammer, bullish engulfing, etc.)
 └─ ✅ Sentiment positive (if available, adds confidence)
 
-SELL Signal Conditions (Require at least 2 of 3):
+SELL Signal Conditions (Require at least 3 of the 6 conditions below):
 ├─ ✅ Strong downtrend confirmed by MA alignment
 ├─ ✅ Price breaks below support with volume surge
 ├─ ✅ RSI declining from overbought (> 60) or strong bearish momentum
@@ -412,16 +449,12 @@ JSON Format:
     "signal": "BUY|SELL|HOLD",
     "confidence": "HIGH|MEDIUM|LOW",
     "reason": "Detailed analysis including: (1) Current trend assessment, (2) Key technical indicators analysis, (3) Support/resistance levels, (4) Volume analysis, (5) Risk factors, (6) Why this signal at this moment. Use ONLY single quotes or parentheses for emphasis, NEVER use double quotes inside this field.",
-    "stop_loss": <numerical_price_value>,
-    "take_profit": <numerical_price_value>,
     "trend_strength": "STRONG|MODERATE|WEAK",
     "risk_assessment": "LOW|MEDIUM|HIGH"
 }}
 
-Example stop_loss/take_profit values:
-- BUY: stop_loss should be current_price * 0.98-0.99, take_profit should be current_price * 1.02-1.03
-- SELL: stop_loss should be current_price * 1.01-1.02, take_profit should be current_price * 0.97-0.98
-- HOLD: Set stop_loss and take_profit to current_price
+Note: Stop-loss and take-profit levels are computed by the execution system
+from current volatility (ATR) - do NOT include them in your response.
 
 Example CORRECT reason format:
 "reason": "(1) Current trend shows strong downward momentum with price below all SMAs. (2) RSI at 35 indicates oversold conditions. (3) Key support at $110,000 being tested. Use single quotes for 'emphasis' if needed."
@@ -470,9 +503,11 @@ Remember: Be decisive but not reckless. Quality over quantity.
 ├─ Short-term: {technical_data.get('short_term_trend', 'N/A')}
 ├─ Medium-term: {technical_data.get('medium_term_trend', 'N/A')}
 ├─ Overall: {technical_data.get('overall_trend', 'N/A')}
+├─ 1-HOUR Trend (higher timeframe): {technical_data.get('htf_trend', 'N/A')} (counter-trend entries are blocked - align with this)
 └─ MACD Direction: {technical_data.get('macd_trend', 'N/A')}
 
 📊 Momentum Indicators:
+├─ ATR(volatility): {safe_float(technical_data.get('atr')):.2f}
 ├─ RSI: {safe_float(technical_data.get('rsi')):.2f} ({'🔴 Overbought (>70)' if safe_float(technical_data.get('rsi')) > 70 else '🟢 Oversold (<30)' if safe_float(technical_data.get('rsi')) < 30 else '⚪ Neutral (30-70)'})
 ├─ MACD Line: {safe_float(technical_data.get('macd')):.4f}
 ├─ Signal Line: {safe_float(technical_data.get('macd_signal')):.4f}
@@ -520,6 +555,50 @@ Remember: Be decisive but not reckless. Quality over quantity.
             f"Bullish {sentiment_data['positive_ratio']:.1%} | "
             f"Bearish {sentiment_data['negative_ratio']:.1%} | "
             f"Net {sign}{sentiment_data['net_sentiment']:.3f}"
+        )
+
+    def _format_trade_history(self, trade_history: Optional[list]) -> str:
+        """Format recent closed-trade outcomes for the prompt."""
+        if not trade_history:
+            return "【Recent Trade Outcomes】No completed trades yet"
+
+        wins = sum(1 for t in trade_history if t.get('outcome') == 'WIN')
+        losses = sum(1 for t in trade_history if t.get('outcome') == 'LOSS')
+        total_pnl = sum(t.get('realized_pnl', 0.0) for t in trade_history)
+
+        text = (
+            f"【Recent Trade Outcomes - LEARN FROM THESE】\n"
+            f"Last {len(trade_history)} trades: {wins} wins / {losses} losses | "
+            f"Net P&L: {total_pnl:+.2f} USDT\n"
+        )
+        for t in trade_history[-5:]:
+            text += (
+                f"├─ {t.get('side', '?')} entry ${t.get('entry_price') or 0:,.2f} → "
+                f"{t.get('outcome', '?')} {t.get('realized_pnl', 0):+.2f} USDT "
+                f"(signal: {t.get('signal', '?')}/{t.get('confidence', '?')})\n"
+            )
+        text += (
+            "└─ If a pattern of losses exists for a signal type, "
+            "require stronger confirmation before repeating it."
+        )
+        return text
+
+    def _format_funding_data(self, funding_data: Optional[Dict[str, Any]]) -> str:
+        """Format perp funding rate context for the prompt."""
+        if not funding_data:
+            return "【Funding Rate】Data not available"
+
+        rate = funding_data.get('funding_rate', 0.0)
+        crowding = (
+            "crowded LONG (longs pay shorts)" if rate > 0.0003
+            else "crowded SHORT (shorts pay longs)" if rate < -0.0003
+            else "balanced"
+        )
+        return (
+            f"【Funding Rate】{rate*100:+.4f}% per 8h - {crowding} | "
+            f"Next funding: {funding_data.get('next_funding_time', 'N/A')}\n"
+            f"Note: holding against funding is a recurring cost; "
+            f"extreme funding often precedes squeezes."
         )
 
     def _format_position_data(self, position: Optional[Dict[str, Any]]) -> str:

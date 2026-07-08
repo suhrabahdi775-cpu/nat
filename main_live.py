@@ -183,14 +183,52 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         rsi_extreme_threshold_lower=25.0,
         rsi_extreme_multiplier=0.7,
 
+        # ATR-based SL/TP geometry
+        atr_sl_multiplier=get_env_float('ATR_SL_MULTIPLIER', '1.5'),
+        min_sl_pct=get_env_float('MIN_SL_PCT', '0.003'),
+        max_sl_pct=get_env_float('MAX_SL_PCT', '0.015'),
+        min_risk_reward=get_env_float('MIN_RISK_REWARD', '1.5'),
+
+        # Higher-timeframe trend filter
+        enable_htf_filter=get_env_str('ENABLE_HTF_FILTER', 'true').lower() == 'true',
+
+        # Loss cooldown (bars) and sizing source
+        loss_cooldown_bars=get_env_int('LOSS_COOLDOWN_BARS', '2'),
+        use_account_balance=get_env_str('USE_ACCOUNT_BALANCE', 'true').lower() == 'true',
+
+        # Profit protection & circuit breakers
+        enable_breakeven_stop=get_env_str('ENABLE_BREAKEVEN_STOP', 'true').lower() == 'true',
+        daily_loss_limit_pct=get_env_float('DAILY_LOSS_LIMIT_PCT', '0.05'),
+        loss_streak_threshold=get_env_int('LOSS_STREAK_THRESHOLD', '2'),
+        max_position_age_bars=get_env_int('MAX_POSITION_AGE_BARS', '24'),
+        reversal_confirmation_signals=get_env_int('REVERSAL_CONFIRMATION_SIGNALS', '2'),
+        min_atr_pct_to_trade=get_env_float('MIN_ATR_PCT_TO_TRADE', '0.001'),
+
+        # TP mode and HTF strictness (defaults OOS-validated on real data)
+        tp_mode=get_env_str('TP_MODE', 'r_multiple'),
+        tp_r_multiple=get_env_float('TP_R_MULTIPLE', '1.0'),
+        htf_strict_alignment=get_env_str('HTF_STRICT_ALIGNMENT', 'true').lower() == 'true',
+
+        # Live-safety: flatten on stop (emulated SL/TP die with the process);
+        # set USE_ORDER_EMULATION=false to place native venue stops instead
+        # (survive crashes, but validate order acceptance on small size first)
+        close_positions_on_stop=get_env_str('CLOSE_POSITIONS_ON_STOP', 'true').lower() == 'true',
+        use_order_emulation=get_env_str('USE_ORDER_EMULATION', 'true').lower() == 'true',
+
+        # Analysis trigger: bar close (fresh data) vs legacy timer
+        analyze_on_bar_close=get_env_str('ANALYZE_ON_BAR_CLOSE', 'true').lower() == 'true',
+
         # Execution
         position_adjustment_threshold=0.001,
 
-        # Timing - Load from YAML config (default: 900 seconds = 15 minutes)
+        # Timing - only used when ANALYZE_ON_BAR_CLOSE=false
         timer_interval_sec=get_env_int('TIMER_INTERVAL_SEC', str(strategy_yaml.get('timer_interval_sec', 900))),
         
-        # Telegram Notifications
-        enable_telegram=strategy_yaml.get('telegram', {}).get('enabled', False),
+        # Telegram Notifications - env var takes precedence over YAML
+        enable_telegram=get_env_str(
+            'ENABLE_TELEGRAM',
+            str(strategy_yaml.get('telegram', {}).get('enabled', False)),
+        ).lower() == 'true',
         telegram_bot_token=get_env_str('TELEGRAM_BOT_TOKEN', ''),
         telegram_chat_id=get_env_str('TELEGRAM_CHAT_ID', ''),
         telegram_notify_signals=strategy_yaml.get('telegram', {}).get('notify_signals', True),

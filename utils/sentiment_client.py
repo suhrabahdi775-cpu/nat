@@ -4,6 +4,8 @@ CryptoOracle Sentiment Data Fetcher for NautilusTrader
 Fetches market sentiment indicators from CryptoOracle API.
 """
 
+import os
+
 import requests
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
@@ -17,7 +19,12 @@ class SentimentDataFetcher:
     """
 
     API_URL = "https://service.cryptoracle.network/openapi/v2/endpoint"
-    API_KEY = "2b144650-4a16-4eb5-bbcd-70824577687b"
+
+    @property
+    def API_KEY(self) -> str:
+        # Read from environment at call time (after load_dotenv), never
+        # hardcode API keys in the repo
+        return os.getenv("CRYPTORACLE_API_KEY", "")
 
     def __init__(self, lookback_hours: int = 4, timeframe: str = "15m"):
         """
@@ -54,6 +61,10 @@ class SentimentDataFetcher:
                 'data_delay_minutes': int
             }
         """
+        if not self.API_KEY:
+            print("⚠️ CRYPTORACLE_API_KEY not set - sentiment data disabled")
+            return None
+
         try:
             # Calculate time range
             end_time = datetime.now()

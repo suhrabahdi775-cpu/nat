@@ -1,198 +1,378 @@
 """
-Professional unit tests for DeepSeek Strategy components.
+Unit tests for DeepSeek Strategy components.
 
-This file tests individual functions in isolation with mocked dependencies.
+Tests the current (post-overhaul) behavior:
+- Margin-based position sizing with working confidence/trend/RSI multipliers
+- Skip (not bump) when below exchange minimum notional
+- ATR-based SL/TP geometry with R:R floor
+- MACD signal-line warmup gating
+- Rule-based analyzer determinism
 """
 import sys
 from pathlib import Path
-from decimal import Decimal
-from unittest.mock import Mock, patch, MagicMock
-import json
 
-# Add parent directory to path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from strategy.deepseek_strategy import DeepSeekAIStrategy, DeepSeekAIStrategyConfig
 
-def test_position_sizing_respects_minimum_notional():
-    """Test that position sizing enforces Binance $100 minimum notional."""
-    from strategy.deepseek_strategy import DeepSeekAIStrategy
 
-    # Create minimal strategy instance
-    strategy = DeepSeekAIStrategy.__new__(DeepSeekAIStrategy)
-    strategy.equity = 400.0
-    strategy.position_config = {
-        'base_usdt_amount': 30.0,  # Below minimum
-        'max_position_ratio': 0.10,
-        'min_trade_amount': 0.001,
-        'confidence_multipliers': {'HIGH': 1.5, 'MEDIUM': 1.0, 'LOW': 0.5},
-        'trend_strength_multiplier': 1.2,
-        'rsi_adjustment': 0.7,
+def make_strategy(**overrides) -> DeepSeekAIStrategy:
+    """Build a real strategy instance without registration/API keys."""
+    params = dict(
+        instrument_id="BTCUSDT-PERP.BINANCE",
+        bar_type="BTCUSDT-PERP.BINANCE-15-MINUTE-LAST-EXTERNAL",
+        equity=500.0,
+        leverage=10.0,
+        base_usdt_amount=100.0,
+        use_rule_based_analyzer=True,   # no API key needed
+        prefetch_bars=False,            # no network calls
+        use_account_balance=False,      # static equity (no portfolio access)
+        enable_telegram=False,
+        sentiment_enabled=False,
+    )
+    params.update(overrides)
+    return DeepSeekAIStrategy(config=DeepSeekAIStrategyConfig(**params))
+
+
+PRICE = {"price": 100_000.0}
+
+
+# ---------- Position sizing ----------
+
+def test_sizing_scales_with_confidence():
+    """HIGH confidence must produce a larger position than MEDIUM."""
+    s = make_strategy()
+    high = s._calculate_position_size(
+        {"confidence": "HIGH"}, PRICE,
+        {"overall_trend": "强势上涨", "rsi": 55.0}, None,
+    )
+    medium = s._calculate_position_size(
+        {"confidence": "MEDIUM"}, PRICE,
+        {"overall_trend": "震荡整理", "rsi": 55.0}, None,
+    )
+    assert high > medium > 0, f"HIGH {high} must exceed MEDIUM {medium}"
+
+
+def test_sizing_reduces_at_extreme_rsi():
+    """Extreme RSI must shrink the position."""
+    s = make_strategy()
+    normal = s._calculate_position_size(
+        {"confidence": "HIGH"}, PRICE,
+        {"overall_trend": "强势上涨", "rsi": 55.0}, None,
+    )
+    extreme = s._calculate_position_size(
+        {"confidence": "HIGH"}, PRICE,
+        {"overall_trend": "强势上涨", "rsi": 80.0}, None,
+    )
+    assert extreme < normal
+
+
+def test_sizing_skips_below_min_notional():
+    """Sizes below the exchange minimum must SKIP, never round up past risk caps."""
+    s = make_strategy()
+    qty = s._calculate_position_size(
+        {"confidence": "LOW"}, PRICE,  # 100 × 0.5 = $50 < $100 minimum
+        {"overall_trend": "震荡整理", "rsi": 55.0}, None,
+    )
+    assert qty == 0.0
+
+
+def test_sizing_respects_margin_risk_cap():
+    """Notional must never exceed equity × ratio × leverage."""
+    s = make_strategy(base_usdt_amount=10_000.0)  # absurdly large base
+    qty = s._calculate_position_size(
+        {"confidence": "HIGH"}, PRICE,
+        {"overall_trend": "强势上涨", "rsi": 55.0}, None,
+    )
+    max_notional = 500.0 * 0.10 * 10.0  # equity × ratio × leverage = $500
+    assert qty * PRICE["price"] <= max_notional + 1e-9
+
+
+def test_sizing_meets_exchange_minimum_when_traded():
+    """Any non-zero size must satisfy the $100 exchange minimum."""
+    s = make_strategy()
+    qty = s._calculate_position_size(
+        {"confidence": "MEDIUM"}, PRICE,
+        {"overall_trend": "震荡整理", "rsi": 55.0}, None,
+    )
+    assert qty == 0.0 or qty * PRICE["price"] >= 100.0
+
+
+# ---------- SL/TP geometry ----------
+
+def test_sl_tp_geometry_buy():
+    """BUY (confidence_pct mode): SL below entry, TP above, R:R >= min_risk_reward."""
+    s = make_strategy(tp_mode="confidence_pct")
+    entry = 100_000.0
+    atr = 400.0  # 1.5×ATR = $600 = 0.6%, within clamps
+    sl, tp = s._compute_sl_tp(is_buy=True, entry_price=entry, confidence="MEDIUM", atr=atr)
+    assert sl < entry < tp
+    sl_dist = entry - sl
+    tp_dist = tp - entry
+    assert abs(sl_dist - 600.0) < 1e-6
+    assert tp_dist / sl_dist >= s.min_risk_reward - 1e-9
+
+
+def test_sl_tp_geometry_sell():
+    """SELL: SL above entry, TP below."""
+    s = make_strategy()
+    entry = 100_000.0
+    sl, tp = s._compute_sl_tp(is_buy=False, entry_price=entry, confidence="MEDIUM", atr=400.0)
+    assert tp < entry < sl
+
+
+def test_sl_clamped_to_max_pct():
+    """A huge ATR must not produce an SL wider than max_sl_pct."""
+    s = make_strategy()
+    entry = 100_000.0
+    sl, _ = s._compute_sl_tp(is_buy=True, entry_price=entry, confidence="MEDIUM", atr=5_000.0)
+    assert entry - sl <= entry * s.max_sl_pct + 1e-6
+
+
+def test_sl_clamped_to_min_pct():
+    """A tiny ATR must not produce an SL tighter than min_sl_pct."""
+    s = make_strategy()
+    entry = 100_000.0
+    sl, _ = s._compute_sl_tp(is_buy=True, entry_price=entry, confidence="MEDIUM", atr=10.0)
+    assert entry - sl >= entry * s.min_sl_pct - 1e-6
+
+
+def test_rr_floor_enforced_for_all_confidences():
+    """confidence_pct mode: TP >= min_risk_reward × SL at every confidence."""
+    s = make_strategy(tp_mode="confidence_pct")
+    entry = 100_000.0
+    for conf in ("HIGH", "MEDIUM", "LOW"):
+        sl, tp = s._compute_sl_tp(is_buy=True, entry_price=entry, confidence=conf, atr=1_000.0)
+        assert (tp - entry) / (entry - sl) >= s.min_risk_reward - 1e-9, conf
+
+
+def test_support_tightens_sl_when_closer_than_atr():
+    """A support level tighter than the ATR distance must be adopted (BUY)."""
+    s = make_strategy()
+    entry = 100_000.0
+    atr = 800.0  # ATR distance = 1200 (1.2%)
+    support = 99_500.0  # S/R distance ≈ 599.5 (with 0.1% buffer) - tighter
+    sl, _ = s._compute_sl_tp(
+        is_buy=True, entry_price=entry, confidence="MEDIUM",
+        atr=atr, support=support,
+    )
+    expected = support * (1 - s.sl_buffer_pct)
+    assert abs(sl - expected) < 1e-6
+
+
+def test_support_never_widens_sl():
+    """A support level FARTHER than the ATR distance must be ignored."""
+    s = make_strategy()
+    entry = 100_000.0
+    atr = 400.0  # ATR distance = 600
+    support = 97_000.0  # 3% away - would be the old inverted-R:R bug
+    sl, _ = s._compute_sl_tp(
+        is_buy=True, entry_price=entry, confidence="MEDIUM",
+        atr=atr, support=support,
+    )
+    assert abs((entry - sl) - 600.0) < 1e-6, "ATR distance must win"
+
+
+def test_resistance_tightens_sl_for_sell():
+    """A resistance level tighter than ATR must be adopted (SELL)."""
+    s = make_strategy()
+    entry = 100_000.0
+    atr = 800.0  # ATR distance = 1200
+    resistance = 100_500.0  # ≈600.5 away with buffer - tighter
+    sl, _ = s._compute_sl_tp(
+        is_buy=False, entry_price=entry, confidence="MEDIUM",
+        atr=atr, resistance=resistance,
+    )
+    expected = resistance * (1 + s.sl_buffer_pct)
+    assert abs(sl - expected) < 1e-6
+
+
+def test_sr_respects_min_clamp():
+    """S/R virtually at the entry price must not produce an SL tighter than min_sl_pct."""
+    s = make_strategy()
+    entry = 100_000.0
+    sl, _ = s._compute_sl_tp(
+        is_buy=True, entry_price=entry, confidence="MEDIUM",
+        atr=400.0, support=99_950.0,  # 0.05% away - inside the noise
+    )
+    assert entry - sl >= entry * s.min_sl_pct - 1e-6
+
+
+# ---------- Indicators ----------
+
+def test_macd_signal_gated_during_warmup():
+    """Signal-line EMA must not receive values until MACD is initialized."""
+    from indicators.technical_manager import TechnicalIndicatorManager
+
+    class FakeBar:
+        def __init__(self, px):
+            self.open = self.high = self.low = self.close = px
+            self.volume = 100.0
+            self.ts_init = 0
+
+    m = TechnicalIndicatorManager()
+    m.update(FakeBar(100.0))
+    m.update(FakeBar(101.0))
+    # After 2 bars MACD(12,26) is NOT initialized: signal EMA must be untouched
+    assert not m.macd.initialized
+    assert not m.macd_signal.initialized
+    assert m.macd_signal.value == 0.0
+
+
+def test_atr_exposed_in_technical_data():
+    from indicators.technical_manager import TechnicalIndicatorManager
+
+    class FakeBar:
+        def __init__(self, px):
+            self.open = px
+            self.high = px + 50
+            self.low = px - 50
+            self.close = px
+            self.volume = 100.0
+            self.ts_init = 0
+
+    m = TechnicalIndicatorManager()
+    for i in range(60):
+        m.update(FakeBar(100_000.0 + i * 10))
+    data = m.get_technical_data(100_000.0)
+    assert "atr" in data
+    assert data["atr"] > 0
+
+
+# ---------- TP modes & HTF strictness ----------
+
+def test_tp_r_multiple_mode():
+    """r_multiple mode: TP distance must be exactly tp_r_multiple × SL distance."""
+    s = make_strategy(tp_mode="r_multiple", tp_r_multiple=1.2)
+    entry = 100_000.0
+    sl, tp = s._compute_sl_tp(is_buy=True, entry_price=entry, confidence="HIGH", atr=400.0)
+    sl_dist = entry - sl
+    tp_dist = tp - entry
+    assert abs(tp_dist - 1.2 * sl_dist) < 1e-6
+
+
+def test_tp_confidence_mode_unchanged():
+    """confidence_pct mode still uses confidence % with R:R floor."""
+    s = make_strategy(tp_mode="confidence_pct")
+    entry = 100_000.0
+    sl, tp = s._compute_sl_tp(is_buy=True, entry_price=entry, confidence="MEDIUM", atr=400.0)
+    assert abs((tp - entry) - entry * 0.02) < 1e-6  # 2% MEDIUM target
+
+
+# ---------- Profit protection & circuit breakers ----------
+
+def _fake_close_event(pnl_side="LONG", entry=100_000.0):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        side=SimpleNamespace(name=pnl_side),
+        avg_px_open=entry,
+        quantity=0.002,
+    )
+
+
+def test_loss_streak_throttles_size():
+    """After 2 consecutive losses, size must shrink (here: below min → skip)."""
+    s = make_strategy()
+    args = (
+        {"confidence": "HIGH"}, PRICE,
+        {"overall_trend": "强势上涨", "rsi": 55.0}, None,
+    )
+    normal = s._calculate_position_size(*args)
+    assert normal > 0
+
+    s.consecutive_losses = 2
+    throttled = s._calculate_position_size(*args)
+    # HIGH: $180 × 0.5 = $90 < $100 exchange min → defensive skip
+    assert throttled == 0.0
+
+    s.consecutive_losses = 0
+    assert s._calculate_position_size(*args) == normal
+
+
+def test_consecutive_losses_tracking():
+    """Loss counter increments on losses and resets on a win."""
+    s = make_strategy()
+    s._day_start_equity = 500.0
+    s._record_trade_outcome(_fake_close_event(), -5.0)
+    s._record_trade_outcome(_fake_close_event(), -3.0)
+    assert s.consecutive_losses == 2
+    s._record_trade_outcome(_fake_close_event(), +4.0)
+    assert s.consecutive_losses == 0
+
+
+def test_daily_loss_breaker_trips():
+    """Breaker must activate once day PnL <= -5% of day-start equity."""
+    s = make_strategy()
+    s._day_start_equity = 500.0
+    assert not s._daily_breaker_active
+    s._record_trade_outcome(_fake_close_event(), -20.0)
+    assert not s._daily_breaker_active  # -4%, under the limit
+    s._record_trade_outcome(_fake_close_event(), -6.0)
+    assert s._daily_breaker_active  # -5.2%, tripped
+
+
+def test_breakeven_flag_set_at_trigger():
+    """Breakeven marks done and computes correct BE price for LONG."""
+    s = make_strategy()
+    key = str(s.instrument_id)
+    state = {
+        "entry_price": 100_000.0,
+        "side": "LONG",
+        "current_sl_price": 99_400.0,
+        "initial_risk": 600.0,   # SL 0.6% below entry
+        "breakeven_done": False,
+        "sl_order_id": None,     # forces the no-op path in the update helper
+        "quantity": 0.002,
+        "highest_price": 100_000.0,
+        "activated": False,
     }
-    strategy.latest_signal_data = {'confidence': 'MEDIUM'}
-    strategy.latest_technical_data = {'trend': 'BULLISH', 'rsi': 0.3}
-    strategy.latest_price_data = {'price': 90000.0}
-    strategy.log = Mock()
-
-    # Calculate position size
-    quantity = strategy._calculate_position_size()
-    notional_value = quantity * 90000.0
-
-    # Assert minimum notional is met
-    assert notional_value >= 100.0, f"Notional ${notional_value:.2f} below $100 minimum"
-    print(f"✅ Position sizing: {quantity:.6f} BTC (${notional_value:.2f}) >= $100 minimum")
+    s.trailing_stop_state[key] = state
+    # Profit 0.5R: must NOT trigger
+    s._check_breakeven(key, state, 100_300.0)
+    assert not state["breakeven_done"]
+    # Profit 1R: must trigger
+    s._check_breakeven(key, state, 100_600.0)
+    assert state["breakeven_done"]
 
 
-def test_position_sizing_scales_with_confidence():
-    """Test that higher confidence results in larger position size."""
-    from strategy.deepseek_strategy import DeepSeekAIStrategy
+def test_reversal_confirmation_blocks_first_signal():
+    """First opposite signal must NOT reverse; streak must increment."""
+    s = make_strategy()
+    current_position = {"side": "long", "quantity": 0.002, "avg_px": 100_000.0}
+    # First opposite signal: returns before touching order plumbing
+    # (order_factory is None pre-registration - would raise if it tried)
+    s._manage_existing_position(current_position, "short", 0.002, "HIGH")
+    assert s._opposite_signal_streak == 1
 
-    strategy = DeepSeekAIStrategy.__new__(DeepSeekAIStrategy)
-    strategy.equity = 400.0
-    strategy.position_config = {
-        'base_usdt_amount': 100.0,
-        'max_position_ratio': 0.10,
-        'min_trade_amount': 0.001,
-        'confidence_multipliers': {'HIGH': 1.5, 'MEDIUM': 1.0, 'LOW': 0.5},
-        'trend_strength_multiplier': 1.2,
-        'rsi_adjustment': 0.7,
+    # A same-direction signal resets the streak
+    s._manage_existing_position(current_position, "long", 0.002, "HIGH")
+    assert s._opposite_signal_streak == 0
+
+
+# ---------- Rule-based analyzer ----------
+
+def test_rule_based_analyzer_deterministic():
+    from utils.rule_based_analyzer import RuleBasedAnalyzer
+
+    tech = {
+        "rsi": 45.0, "macd_histogram": 5.0,
+        "sma_5": 101.0, "sma_20": 100.0, "sma_50": 99.0,
     }
-    strategy.latest_technical_data = {'trend': 'BULLISH', 'rsi': 0.3}
-    strategy.latest_price_data = {'price': 90000.0}
-    strategy.log = Mock()
-
-    sizes = {}
-    for confidence in ['LOW', 'MEDIUM', 'HIGH']:
-        strategy.latest_signal_data = {'confidence': confidence}
-        sizes[confidence] = strategy._calculate_position_size()
-
-    assert sizes['LOW'] < sizes['MEDIUM'] < sizes['HIGH'], \
-        "Position size should increase with confidence"
-    print(f"✅ Confidence scaling: LOW={sizes['LOW']:.6f} < MEDIUM={sizes['MEDIUM']:.6f} < HIGH={sizes['HIGH']:.6f}")
+    price = {"price": 102.0}
+    a1 = RuleBasedAnalyzer().analyze(price, tech)
+    a2 = RuleBasedAnalyzer().analyze(price, tech)
+    assert a1["signal"] == a2["signal"]
+    assert a1["signal"] in ("BUY", "SELL", "HOLD")
+    assert a1["confidence"] in ("HIGH", "MEDIUM", "LOW")
 
 
-def test_deepseek_response_parsing():
-    """Test parsing of DeepSeek AI JSON response."""
-    from ai_client.deepseek_client import DeepSeekClient
+def test_rule_based_analyzer_bullish_alignment():
+    """Full bullish alignment (MA + RSI recovery + MACD) must produce BUY."""
+    from utils.rule_based_analyzer import RuleBasedAnalyzer
 
-    # Mock response from DeepSeek
-    mock_response = {
-        "signal": "BUY",
-        "confidence": "HIGH",
-        "reason": "Strong bullish momentum with RSI oversold",
-        "stop_loss": 0.01,
-        "take_profit": 0.03
+    tech = {
+        "rsi": 35.0, "macd_histogram": 5.0,
+        "sma_5": 101.0, "sma_20": 100.0, "sma_50": 99.0,
     }
-
-    # Mock the OpenAI client
-    with patch('ai_client.deepseek_client.OpenAI') as MockOpenAI:
-        mock_client = MockOpenAI.return_value
-        mock_choice = Mock()
-        mock_choice.message.content = json.dumps(mock_response)
-        mock_client.chat.completions.create.return_value = Mock(choices=[mock_choice])
-
-        # Create client and get analysis
-        client = DeepSeekClient(api_key="test_key", model="test_model")
-        result = client.get_trading_signal(
-            prompt="test prompt",
-            kline_data=[],
-            indicators={},
-            current_position=None
-        )
-
-        assert result['signal'] == 'BUY'
-        assert result['confidence'] == 'HIGH'
-        assert 'reason' in result
-        print(f"✅ DeepSeek response parsing: signal={result['signal']}, confidence={result['confidence']}")
-
-
-def test_stop_loss_calculation_uses_support():
-    """Test that stop loss is calculated using support levels."""
-    from strategy.deepseek_strategy import DeepSeekAIStrategy
-
-    strategy = DeepSeekAIStrategy.__new__(DeepSeekAIStrategy)
-    strategy.sl_use_support_resistance = True
-    strategy.sl_buffer_pct = 0.001  # 0.1% buffer
-    strategy.latest_technical_data = {'support': 89000.0}
-    strategy.latest_price_data = {'price': 91000.0}
-    strategy.latest_signal_data = {'confidence': 'HIGH'}
-    strategy.sl_pct_config = {'HIGH': 0.01}
-    strategy.log = Mock()
-
-    # Calculate stop loss
-    current_price = 91000.0
-    expected_sl = 89000.0 * (1 - 0.001)  # support with buffer
-
-    # Mock the method
-    strategy._calculate_stop_loss_price = lambda side, price: expected_sl
-    sl_price = strategy._calculate_stop_loss_price('BUY', current_price)
-
-    assert abs(sl_price - expected_sl) < 1.0, \
-        f"Stop loss {sl_price} should be near support {expected_sl}"
-    print(f"✅ Stop loss calculation: ${sl_price:.2f} (support: $89,000)")
-
-
-def test_take_profit_scales_with_confidence():
-    """Test that take profit percentage scales with confidence level."""
-    from strategy.deepseek_strategy import DeepSeekAIStrategy
-
-    strategy = DeepSeekAIStrategy.__new__(DeepSeekAIStrategy)
-    strategy.tp_pct_config = {'HIGH': 0.03, 'MEDIUM': 0.02, 'LOW': 0.01}
-    strategy.latest_price_data = {'price': 90000.0}
-    strategy.log = Mock()
-
-    current_price = 90000.0
-
-    for confidence, expected_pct in [('LOW', 0.01), ('MEDIUM', 0.02), ('HIGH', 0.03)]:
-        strategy.latest_signal_data = {'confidence': confidence}
-        expected_tp = current_price * (1 + expected_pct)
-
-        # Mock the method
-        strategy._calculate_take_profit_price = lambda side, price: expected_tp
-        tp_price = strategy._calculate_take_profit_price('BUY', current_price)
-
-        assert abs(tp_price - expected_tp) < 1.0, \
-            f"TP for {confidence} should be ${expected_tp:.2f}"
-
-    print(f"✅ Take profit scaling: LOW=1%, MEDIUM=2%, HIGH=3%")
-
-
-def run_all_tests():
-    """Run all unit tests."""
-    tests = [
-        ("Position Sizing - Minimum Notional", test_position_sizing_respects_minimum_notional),
-        ("Position Sizing - Confidence Scaling", test_position_sizing_scales_with_confidence),
-        ("DeepSeek Response Parsing", test_deepseek_response_parsing),
-        ("Stop Loss Calculation", test_stop_loss_calculation_uses_support),
-        ("Take Profit Scaling", test_take_profit_scales_with_confidence),
-    ]
-
-    print("\n" + "="*60)
-    print("Running Unit Tests for Strategy Components")
-    print("="*60 + "\n")
-
-    passed = 0
-    failed = 0
-
-    for name, test_func in tests:
-        try:
-            print(f"\nTest: {name}")
-            print("-" * 60)
-            test_func()
-            passed += 1
-        except Exception as e:
-            print(f"❌ FAILED: {name}")
-            print(f"   Error: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            failed += 1
-
-    print("\n" + "="*60)
-    print(f"Results: {passed} passed, {failed} failed")
-    print("="*60 + "\n")
-
-    return failed == 0
-
-
-if __name__ == "__main__":
-    success = run_all_tests()
-    sys.exit(0 if success else 1)
+    result = RuleBasedAnalyzer().analyze({"price": 102.0}, tech)
+    assert result["signal"] == "BUY"

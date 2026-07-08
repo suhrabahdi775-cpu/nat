@@ -1,0 +1,162 @@
+"""
+Backtest Harness for the DeepSeek AI Strategy
+
+Runs the EXACT same strategy class used in live trading against historical
+klines, with the rule-based analyzer replacing the DeepSeek API (deterministic,
+free, offline). This validates the execution pipeline end-to-end: sizing,
+bracket SL/TP geometry, reversals, trailing stops, partial TPs, cooldowns,
+and the HTF filter.
+
+Usage:
+    python backtest/run_backtest.py --csv data/BTCUSDT_15m.csv
+    python backtest/run_backtest.py --csv data/BTCUSDT_15m.csv --htf-csv data/BTCUSDT_1h.csv
+
+CSV format (from tools/download_klines.py):
+    timestamp,open,high,low,close,volume
+    2025-01-01 00:00:00,93576.0,93650.1,93400.0,93521.3,412.5
+"""
+
+import argparse
+import sys
+from decimal import Decimal
+from pathlib import Path
+
+# Make project modules importable when run from repo root or backtest/
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import pandas as pd
+
+from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
+from nautilus_trader.config import LoggingConfig
+from nautilus_trader.model.currencies import USDT
+from nautilus_trader.model.data import BarType
+from nautilus_trader.model.enums import AccountType, OmsType
+from nautilus_trader.model.identifiers import TraderId, Venue
+from nautilus_trader.model.objects import Money
+from nautilus_trader.persistence.wranglers import BarDataWrangler
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
+
+from strategy.deepseek_strategy import DeepSeekAIStrategy, DeepSeekAIStrategyConfig
+
+
+def load_bars_from_csv(csv_path: str, bar_type: BarType, instrument):
+    """Load a klines CSV into Nautilus Bar objects."""
+    df = pd.read_csv(csv_path)
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df = df.set_index('timestamp').sort_index()
+    df = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+
+    wrangler = BarDataWrangler(bar_type=bar_type, instrument=instrument)
+    return wrangler.process(df)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Backtest the DeepSeek AI strategy")
+    parser.add_argument("--csv", required=True, help="15m klines CSV path")
+    parser.add_argument("--htf-csv", default=None, help="1h klines CSV path (optional, enables HTF filter)")
+    parser.add_argument("--equity", type=float, default=500.0, help="Starting USDT balance")
+    parser.add_argument("--leverage", type=float, default=10.0)
+    parser.add_argument("--base-position", type=float, default=100.0, help="Base position notional (USDT)")
+    parser.add_argument("--log-level", default="ERROR", help="Engine log level (ERROR keeps output readable)")
+    args = parser.parse_args()
+
+    # --- Engine ---
+    engine = BacktestEngine(
+        config=BacktestEngineConfig(
+            trader_id=TraderId("BACKTESTER-001"),
+            logging=LoggingConfig(log_level=args.log_level),
+        )
+    )
+
+    # --- Venue: Binance Futures-like margin account, netting OMS ---
+    BINANCE = Venue("BINANCE")
+    engine.add_venue(
+        venue=BINANCE,
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        base_currency=None,
+        starting_balances=[Money(args.equity, USDT)],
+    )
+
+    # --- Instrument (matches the live instrument ID exactly) ---
+    instrument = TestInstrumentProvider.btcusdt_perp_binance()
+    engine.add_instrument(instrument)
+
+    # --- Data ---
+    bar_type = BarType.from_str("BTCUSDT-PERP.BINANCE-15-MINUTE-LAST-EXTERNAL")
+    bars = load_bars_from_csv(args.csv, bar_type, instrument)
+    print(f"Loaded {len(bars)} x 15m bars from {args.csv}")
+    engine.add_data(bars)
+
+    enable_htf = args.htf_csv is not None
+    if enable_htf:
+        htf_bar_type = BarType.from_str("BTCUSDT-PERP.BINANCE-1-HOUR-LAST-EXTERNAL")
+        htf_bars = load_bars_from_csv(args.htf_csv, htf_bar_type, instrument)
+        print(f"Loaded {len(htf_bars)} x 1h bars from {args.htf_csv}")
+        engine.add_data(htf_bars)
+
+    # --- Strategy: same class as live, rule-based analyzer, no REST prefetch ---
+    config = DeepSeekAIStrategyConfig(
+        instrument_id="BTCUSDT-PERP.BINANCE",
+        bar_type="BTCUSDT-PERP.BINANCE-15-MINUTE-LAST-EXTERNAL",
+        equity=args.equity,
+        leverage=args.leverage,
+        base_usdt_amount=args.base_position,
+        use_rule_based_analyzer=True,   # deterministic, no API calls
+        prefetch_bars=False,            # history comes from the engine
+        use_order_emulation=False,      # bars-only data starves the emulator
+        sentiment_enabled=False,        # no live API calls in backtest
+        enable_telegram=False,
+        enable_htf_filter=enable_htf,
+        analyze_on_bar_close=True,
+        use_account_balance=True,
+    )
+    engine.add_strategy(DeepSeekAIStrategy(config=config))
+
+    # --- Run ---
+    engine.run()
+
+    # --- Report ---
+    print("\n" + "=" * 70)
+    print("BACKTEST RESULTS")
+    print("=" * 70)
+
+    account = engine.trader.generate_account_report(BINANCE)
+    if not account.empty:
+        final_balance = account.iloc[-1]
+        print(f"Final account state:\n{final_balance}\n")
+
+    fills = engine.trader.generate_order_fills_report()
+    positions = engine.trader.generate_positions_report()
+    print(f"Orders filled: {len(fills)}")
+    print(f"Positions: {len(positions)}")
+
+    if not positions.empty and "realized_pnl" in positions.columns:
+        pnls = positions["realized_pnl"].apply(
+            lambda x: float(str(x).split(" ")[0]) if x is not None else 0.0
+        )
+        wins = (pnls > 0).sum()
+        losses = (pnls < 0).sum()
+        total = pnls.sum()
+        win_rate = wins / max(wins + losses, 1) * 100
+        print(f"Win/Loss: {wins}/{losses} ({win_rate:.1f}% win rate)")
+        print(f"Total realized PnL: {total:+.2f} USDT")
+        if losses > 0 and wins > 0:
+            avg_win = pnls[pnls > 0].mean()
+            avg_loss = abs(pnls[pnls < 0].mean())
+            print(f"Avg win: {avg_win:.2f} | Avg loss: {avg_loss:.2f} "
+                  f"| Realized R:R: {avg_win/avg_loss:.2f}")
+
+    # Persist full reports for inspection
+    out_dir = Path("logs/backtest")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fills.to_csv(out_dir / "fills.csv")
+    positions.to_csv(out_dir / "positions.csv")
+    account.to_csv(out_dir / "account.csv")
+    print(f"\nDetailed reports written to {out_dir}/")
+
+    engine.dispose()
+
+
+if __name__ == "__main__":
+    main()

@@ -36,6 +36,7 @@ class TechnicalIndicatorManager:
         bb_std: float = 2.0,
         volume_ma_period: int = 20,
         support_resistance_lookback: int = 20,
+        atr_period: int = 14,
     ):
         """
         Initialize technical indicator manager.
@@ -84,6 +85,10 @@ class TechnicalIndicatorManager:
         self.bb_period = bb_period
         self.bb_std = bb_std
 
+        # ATR (volatility for adaptive SL/TP sizing)
+        self.atr = AverageTrueRange(atr_period)
+        self.atr_period = atr_period
+
         # Volume MA
         self.volume_sma = SimpleMovingAverage(volume_ma_period)
 
@@ -127,7 +132,18 @@ class TechnicalIndicatorManager:
 
         # Update MACD
         self.macd.update_raw(float(bar.close))
-        self.macd_signal.update_raw(self.macd.value)
+        # Only feed the signal-line EMA once MACD itself is initialized,
+        # otherwise warmup garbage pollutes the signal line (and histogram)
+        # for a long stretch after every restart.
+        if self.macd.initialized:
+            self.macd_signal.update_raw(self.macd.value)
+
+        # Update ATR
+        self.atr.update_raw(
+            float(bar.high),
+            float(bar.low),
+            float(bar.close),
+        )
 
         # Update Bollinger Band SMA
         self.bb_sma.update_raw(float(bar.close))
@@ -201,6 +217,8 @@ class TechnicalIndicatorManager:
             "bb_position": bb_position,
             # Volume
             "volume_ratio": volume_ratio,
+            # ATR (0.0 until initialized)
+            "atr": self.atr.value if self.atr.initialized else 0.0,
             # Support/Resistance
             "support": support,
             "resistance": resistance,

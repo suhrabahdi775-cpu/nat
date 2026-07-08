@@ -46,34 +46,38 @@
 - **Intelligent Position Sizing**: Dynamic sizing based on AI confidence, trend strength, RSI extremes, and risk limits
 - **Event-Driven Architecture**: Built on NautilusTrader's professional framework for high-performance execution
 
-### Advanced Risk Management (v1.2.x)
+### Advanced Risk Management (v1.3.x)
 
 - **Automated Stop Loss & Take Profit**:
-  - Stop loss based on support/resistance levels with configurable buffer
-  - Take profit targets adjusted by AI confidence (1-3%)
+  - ATR-based (volatility-adaptive) stop loss, clamped to [0.3%, 1.5%] of entry
+  - Support/resistance refinement: S/R level (with buffer) used when TIGHTER than ATR distance
+  - Take profit targets adjusted by AI confidence (1-3%), with a hard risk:reward floor (TP ≥ 1.5× SL distance)
   - STOP_MARKET orders for stop loss, LIMIT orders for take profit
 
 - **OCO (One-Cancels-the-Other) Management**:
-  - Automatic cancellation of peer orders when one executes
-  - Redis persistence for OCO groups (survives strategy restarts)
-  - Automatic cleanup of orphan orders
-  - Event-driven order management
+  - Automatic cancellation of peer orders when one executes (native NautilusTrader bracket contingencies)
+  - Event-driven cleanup on position close + per-bar orphan-order safety net
+  - Note: the legacy Redis-backed OCO manager is deprecated - bracket orders
+    handle OCO natively and Redis is no longer required
 
 - **Bracket Orders**:
   - Native NautilusTrader bracket order support for Binance
   - Simultaneous SL/TP submission with position entry
   - Order emulation for exchanges without native bracket support
+  - Position reversals and size adjustments are also bracket-protected
 
 - **Partial Take Profit**:
   - Multiple take profit levels to lock in profits gradually
   - Configurable profit thresholds and position percentages
   - Example: Take 50% profit at +2%, remaining 50% at +4%
-  - Reduces risk while maintaining upside potential
+  - Automatically falls back to a single TP when slices would violate
+    exchange minimum notional (~$100 on Binance Futures)
+  - Stop loss automatically re-sized to the remaining position after each level fills
 
 - **Trailing Stop Loss**:
   - Dynamic stop loss that follows profitable price movement
   - Activates after minimum profit threshold (default 1%)
-  - Locks in profits while allowing trend continuation
+  - Updates in place via order modification (preserves OCO linkage with TP)
   - Configurable trailing distance and update frequency
 
 ### Remote Control & Monitoring
@@ -87,12 +91,19 @@
 ### Safety Features
 
 - Minimum confidence filtering (configurable: LOW/MEDIUM/HIGH)
-- Maximum position size limits (default: 10% of equity)
+- Margin-based position size limits (default: 10% of equity as margin)
 - RSI extreme condition handling (0.7x multiplier at RSI >75 or <25)
 - Position reversal protection with confidence requirements
+- Reversal confirmation: N consecutive opposite signals required before flipping (default 2)
+- Breakeven stop: SL moves to entry once profit reaches 1× initial risk
+- Daily loss circuit breaker: new entries halt after -5% realized day PnL (resets each UTC day)
+- Loss-streak throttle: position size halves after 2 consecutive losses until the next win
+- Loss cooldown: no new entries for N bars after a losing trade
+- Stagnant position exit: positions that never reach +1% within 24 bars are closed
+- Dead-market filter: entries skipped when ATR < 0.1% of price
+- Higher-timeframe (1h) trend filter blocks counter-trend entries
 - Minimum adjustment thresholds to prevent excessive trading
 - Comprehensive logging and monitoring
-- Redis-backed OCO persistence for crash recovery
 
 ---
 

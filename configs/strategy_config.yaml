@@ -60,12 +60,37 @@ strategy:
     rsi_extreme_multiplier: 0.7
     
     # Stop Loss & Take Profit (自动止损止盈)
+    # NOTE: SL is now ATR-based (volatility-adaptive), clamped to
+    # [min_sl_pct, max_sl_pct]. TP is confidence-based with a hard
+    # risk:reward floor (min_risk_reward). Env overrides:
+    # ATR_SL_MULTIPLIER, MIN_SL_PCT, MAX_SL_PCT, MIN_RISK_REWARD
     enable_auto_sl_tp: true  # 启用自动止损止盈
-    sl_use_support_resistance: true  # 使用支撑阻力位作为止损
-    sl_buffer_pct: 0.001  # 止损缓冲 (0.1% 在支撑/阻力位之外)
+    atr_sl_multiplier: 1.5   # SL 距离 = 1.5 × ATR
+    min_sl_pct: 0.003        # SL 最小距离 0.3%
+    max_sl_pct: 0.015        # SL 最大距离 1.5% (10x杠杆下 = 15% 保证金)
+    min_risk_reward: 1.5     # TP 距离 >= 1.5 × SL 距离
     tp_high_confidence_pct: 0.03  # 高信心止盈: 3%
     tp_medium_confidence_pct: 0.02  # 中等信心止盈: 2%
     tp_low_confidence_pct: 0.01  # 低信心止盈: 1%
+
+    # Higher-timeframe trend filter (1h) - 高时间框架趋势过滤
+    enable_htf_filter: true  # 禁止逆1h趋势开新仓 (env: ENABLE_HTF_FILTER)
+
+    # Loss cooldown - 亏损冷却
+    loss_cooldown_bars: 2  # 止损后N根K线内不开新仓 (env: LOSS_COOLDOWN_BARS)
+
+    # Take-profit mode - 止盈模式 (OOS-validated defaults, July 2026)
+    tp_mode: "r_multiple"        # r_multiple: TP = tp_r_multiple × SL距离 (env: TP_MODE)
+    tp_r_multiple: 1.0           # 1R目标 → 更高胜率 (env: TP_R_MULTIPLE)
+    htf_strict_alignment: true   # 仅顺1h趋势开仓 (env: HTF_STRICT_ALIGNMENT)
+
+    # Profit protection & circuit breakers - 利润保护与熔断
+    enable_breakeven_stop: true       # 盈利达1R后止损移至保本 (env: ENABLE_BREAKEVEN_STOP)
+    daily_loss_limit_pct: 0.05        # 日亏损超5%停止开新仓 (env: DAILY_LOSS_LIMIT_PCT)
+    loss_streak_threshold: 2          # 连亏2次后仓位减半 (env: LOSS_STREAK_THRESHOLD)
+    max_position_age_bars: 24         # 24根K线未盈利1%则平仓 (env: MAX_POSITION_AGE_BARS)
+    reversal_confirmation_signals: 2  # 需连续2次反向信号才反手 (env: REVERSAL_CONFIRMATION_SIGNALS)
+    min_atr_pct_to_trade: 0.001       # ATR低于0.1%不开新仓 (env: MIN_ATR_PCT_TO_TRADE)
     
     # OCO (One-Cancels-the-Other) Management
     enable_oco: true  # 启用 OCO 自动取消机制

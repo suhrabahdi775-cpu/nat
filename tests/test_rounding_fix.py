@@ -139,69 +139,41 @@ def test_rounding_fix_at_various_prices():
 
 
 def test_actual_strategy_position_sizing():
-    """Test the actual _calculate_position_size method with the fix."""
-    print("\n" + "="*70)
-    print("Testing Actual Strategy Position Sizing")
-    print("="*70)
+    """
+    Test the real _calculate_position_size at the problem price ($90,303).
 
-    from strategy.deepseek_strategy import DeepSeekAIStrategy
-    import logging
+    At this price $100 rounds to 0.001 BTC = $90.30 notional (below the
+    exchange minimum). The strategy must round UP to 0.002 - but only
+    because that stays within the margin-based risk cap.
+    """
+    from strategy.deepseek_strategy import DeepSeekAIStrategy, DeepSeekAIStrategyConfig
 
-    # Create strategy instance
-    strategy = DeepSeekAIStrategy.__new__(DeepSeekAIStrategy)
-    strategy.base_usdt = 100.0
-    strategy.equity = 400.0
-    strategy.position_config = {
-        'high_confidence_multiplier': 1.5,
-        'medium_confidence_multiplier': 1.0,
-        'low_confidence_multiplier': 0.5,
-        'max_position_ratio': 0.10,
-        'min_trade_amount': 0.001,
-        'trend_strength_multiplier': 1.2,
-    }
-    strategy.rsi_extreme_upper = 75.0
-    strategy.rsi_extreme_lower = 25.0
-    strategy.rsi_extreme_mult = 0.7
+    strategy = DeepSeekAIStrategy(config=DeepSeekAIStrategyConfig(
+        instrument_id="BTCUSDT-PERP.BINANCE",
+        bar_type="BTCUSDT-PERP.BINANCE-15-MINUTE-LAST-EXTERNAL",
+        equity=400.0,
+        leverage=10.0,
+        base_usdt_amount=100.0,
+        use_rule_based_analyzer=True,
+        prefetch_bars=False,
+        use_account_balance=False,
+        enable_telegram=False,
+        sentiment_enabled=False,
+    ))
 
-    # Set up logging - create a real logger instance
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger('test_strategy')
-    # Use object.__setattr__ to bypass NautilusTrader's read-only protection
-    object.__setattr__(strategy, 'log', logger)
-
-    # Test at problem price ($90,303)
-    signal_data = {'confidence': 'MEDIUM'}
-    price_data = {'price': 90303.60}
-    technical_data = {
-        'overall_trend': '强势下跌',
-        'rsi': 0.36  # Oversold, triggers RSI multiplier
-    }
-    current_position = None
-
-    print(f"\n📊 Test Scenario:")
-    print(f"   Price: ${price_data['price']:,.2f}")
-    print(f"   Confidence: {signal_data['confidence']}")
-    print(f"   RSI: {technical_data['rsi']} (oversold)")
-    print(f"   Trend: {technical_data['overall_trend']}")
-
-    # Calculate position size
     quantity = strategy._calculate_position_size(
-        signal_data, price_data, technical_data, current_position
+        {'confidence': 'MEDIUM'},
+        {'price': 90303.60},
+        {'overall_trend': '震荡整理', 'rsi': 55.0},
+        None,
     )
 
-    # Calculate final notional
-    final_notional = quantity * price_data['price']
-
-    print(f"\n✅ Result:")
-    print(f"   Quantity: {quantity:.3f} BTC")
-    print(f"   Notional: ${final_notional:.2f}")
-
-    # Assert minimum notional is met
-    assert final_notional >= 100.0, \
+    final_notional = quantity * 90303.60
+    # Must either skip (0) or satisfy the exchange minimum
+    assert quantity == 0.0 or final_notional >= 100.0, \
         f"Final notional ${final_notional:.2f} should be >= $100"
-
-    print(f"\n✅ PASS: Actual strategy meets minimum notional requirement")
-    print(f"   ${final_notional:.2f} >= $100.00")
+    # At these settings the risk cap ($400) allows the round-up to 0.002
+    assert quantity == 0.002, f"Expected 0.002 BTC, got {quantity}"
 
     return True
 
