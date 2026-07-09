@@ -86,6 +86,14 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     tp_medium_confidence_pct: float = 0.02
     tp_low_confidence_pct: float = 0.01
 
+    # Position sizing mode:
+    # "risk"     - size so a stop-out loses risk_per_trade_pct × equity,
+    #              scaled by confidence/trend/RSI/streak. Notional adapts to
+    #              the ATR stop distance (tight stop -> bigger position).
+    # "notional" - legacy: fixed base_usdt_amount × multipliers.
+    sizing_mode: str = "risk"
+    risk_per_trade_pct: float = 0.01  # 1% of equity risked at the stop (MEDIUM conf)
+
     # ATR-based adaptive SL/TP (preferred over support/resistance when ATR ready)
     atr_period: int = 14
     atr_sl_multiplier: float = 1.5
@@ -268,6 +276,10 @@ class DeepSeekAIStrategy(Strategy):
             'MEDIUM': config.tp_medium_confidence_pct,
             'LOW': config.tp_low_confidence_pct,
         }
+
+        # Sizing mode
+        self.sizing_mode = config.sizing_mode
+        self.risk_per_trade_pct = config.risk_per_trade_pct
 
         # ATR-based SL/TP parameters
         self.atr_sl_multiplier = config.atr_sl_multiplier
@@ -665,22 +677,29 @@ class DeepSeekAIStrategy(Strategy):
             symbol_str = str(self.instrument_id)
             symbol = symbol_str.split('-')[0]
 
-            # Convert bar type to Binance interval
+            # Convert bar type to Binance interval.
+            # IMPORTANT: match longest tokens first. Substring checks are
+            # unsafe here - '5-MINUTE' is a substring of '15-MINUTE', so a
+            # naive '5-MINUTE' check would (and did) mis-map 15m bars to 5m,
+            # warming the indicators with the wrong-resolution history.
             bar_type_str = str(self.bar_type)
-            if '1-MINUTE' in bar_type_str:
-                interval = '1m'
-            elif '5-MINUTE' in bar_type_str:
-                interval = '5m'
-            elif '15-MINUTE' in bar_type_str:
-                interval = '15m'
-            elif '1-HOUR' in bar_type_str:
-                interval = '1h'
-            elif '4-HOUR' in bar_type_str:
-                interval = '4h'
-            elif '1-DAY' in bar_type_str:
-                interval = '1d'
-            else:
-                interval = '5m'  # Default fallback
+            interval_map = [
+                ('15-MINUTE', '15m'),
+                ('30-MINUTE', '30m'),
+                ('5-MINUTE', '5m'),
+                ('3-MINUTE', '3m'),
+                ('1-MINUTE', '1m'),
+                ('12-HOUR', '12h'),
+                ('4-HOUR', '4h'),
+                ('2-HOUR', '2h'),
+                ('1-HOUR', '1h'),
+                ('1-DAY', '1d'),
+            ]
+            interval = '5m'  # Default fallback
+            for token, iv in interval_map:
+                if token in bar_type_str:
+                    interval = iv
+                    break
 
             self.log.info(
                 f"📡 Pre-fetching {limit} historical bars from Binance "
@@ -1288,15 +1307,47 @@ class DeepSeekAIStrategy(Strategy):
         ):
             streak_mult = self.loss_streak_multiplier
 
-        # Calculate suggested USDT (notional)
-        suggested_usdt = base_usdt * conf_mult * trend_mult * rsi_mult * streak_mult
+        equity = self._get_effective_equity()
+        current_price = price_data['price']
+        combined_mult = conf_mult * trend_mult * rsi_mult * streak_mult
+
+        # Target notional by sizing mode.
+        if self.sizing_mode == "risk":
+            # Size so a stop-out loses (risk_per_trade_pct × combined_mult) of
+            # equity. Notional = risk_usd / stop_distance_fraction, using the
+            # SAME stop the bracket will place -> risk is consistent whether
+            # the ATR stop is tight or wide (this is the whole point).
+            is_buy = signal_data.get('signal') == 'BUY'
+            atr = technical_data.get('atr', 0.0)
+            sl_distance, _ = self._compute_sl_distance(
+                is_buy, current_price, atr,
+                technical_data.get('support', 0.0),
+                technical_data.get('resistance', 0.0),
+            )
+            stop_frac = sl_distance / current_price if current_price > 0 else 0.0
+            if stop_frac <= 0:
+                self.log.warning("⚠️ Stop distance is 0, cannot risk-size; skipping")
+                return 0.0
+            risk_usd = equity * self.risk_per_trade_pct * combined_mult
+            suggested_usdt = risk_usd / stop_frac
+            sizing_desc = (
+                f"Risk {self.risk_per_trade_pct:.1%}×{combined_mult:.2f}="
+                f"${risk_usd:.2f} / stop {stop_frac:.2%}"
+            )
+        else:
+            # Legacy fixed-notional: base × multipliers
+            suggested_usdt = base_usdt * combined_mult
+            sizing_desc = (
+                f"Base:{base_usdt} × Conf:{conf_mult} × Trend:{trend_mult} "
+                f"× RSI:{rsi_mult}"
+                f"{f' × Streak:{streak_mult}' if streak_mult != 1.0 else ''}"
+            )
 
         # Risk cap: max_position_ratio applies to MARGIN (equity at risk).
         # With leverage, the equivalent notional cap is margin_cap × leverage.
         # (The old code applied the ratio to notional directly, which made the
         # cap smaller than the exchange minimum and forced every trade to a
         # constant $100 — killing confidence/trend/RSI-based sizing entirely.)
-        equity = self._get_effective_equity()
         max_margin = equity * self.position_config['max_position_ratio']
         max_notional = max_margin * self.leverage
         final_usdt = min(suggested_usdt, max_notional)
@@ -1317,7 +1368,6 @@ class DeepSeekAIStrategy(Strategy):
         # BTC prices one 0.001 step is ~$100 of notional, so flooring would
         # collapse confidence-differentiated sizes back to the same quantity.
         # The risk cap is still enforced after rounding (floor if exceeded).
-        current_price = price_data['price']
         import math
         btc_quantity = round(final_usdt / current_price, 3)
         if btc_quantity * current_price > max_notional:
@@ -1343,14 +1393,13 @@ class DeepSeekAIStrategy(Strategy):
             )
             return 0.0
 
+        actual_notional = btc_quantity * current_price
         self.log.info(
-            f"📊 Position Sizing: "
-            f"Base:{base_usdt} × Conf:{conf_mult} × Trend:{trend_mult} × RSI:{rsi_mult}"
-            f"{f' × Streak:{streak_mult}' if streak_mult != 1.0 else ''} "
+            f"📊 Position Sizing [{self.sizing_mode}]: {sizing_desc} "
             f"= ${final_usdt:.2f} (cap ${max_notional:.2f}, equity ${equity:.2f}) "
             f"= {btc_quantity:.3f} BTC "
-            f"(notional: ${btc_quantity * current_price:.2f}, "
-            f"margin: ${btc_quantity * current_price / self.leverage:.2f})"
+            f"(notional: ${actual_notional:.2f}, "
+            f"margin: ${actual_notional / self.leverage:.2f})"
         )
 
         return btc_quantity
@@ -1550,28 +1599,19 @@ class DeepSeekAIStrategy(Strategy):
             f"(reduce_only={reduce_only})"
         )
     
-    def _compute_sl_tp(
+    def _compute_sl_distance(
         self,
         is_buy: bool,
         entry_price: float,
-        confidence: str,
         atr: float,
         support: float = 0.0,
         resistance: float = 0.0,
-    ) -> Tuple[float, float]:
+    ) -> Tuple[float, str]:
         """
-        Compute stop-loss and take-profit prices from volatility.
-
-        SL distance: ATR-based, clamped to [min_sl_pct, max_sl_pct] of entry.
-        When sl_use_support_resistance is enabled and a support/resistance
-        level (plus buffer) sits TIGHTER than the ATR distance, the S/R level
-        is used instead - S/R can only tighten the stop, never widen it.
-
-        TP distance: confidence-based %, floored at min_risk_reward × SL.
-
-        (The old approach used the raw 20-bar low/high for SL, which could
-        sit 3-5% away: at 10x leverage a 5% stop-out is 50% of the margin
-        behind the trade, against a fixed 2% TP - inverted risk/reward.)
+        Stop-loss distance (in price units) from ATR, clamped and optionally
+        tightened by structure. Shared by the risk-based sizer and the
+        bracket builder so both use the IDENTICAL stop - the sizer's risk
+        math is only correct if the actual stop matches what it assumed.
         """
         if atr > 0:
             sl_distance = self.atr_sl_multiplier * atr
@@ -1598,6 +1638,35 @@ class DeepSeekAIStrategy(Strategy):
             if sr_distance is not None and min_dist <= sr_distance < sl_distance:
                 sl_distance = sr_distance
                 sl_basis = "support/resistance (tighter than ATR)"
+
+        return sl_distance, sl_basis
+
+    def _compute_sl_tp(
+        self,
+        is_buy: bool,
+        entry_price: float,
+        confidence: str,
+        atr: float,
+        support: float = 0.0,
+        resistance: float = 0.0,
+    ) -> Tuple[float, float]:
+        """
+        Compute stop-loss and take-profit prices from volatility.
+
+        SL distance: ATR-based, clamped to [min_sl_pct, max_sl_pct] of entry.
+        When sl_use_support_resistance is enabled and a support/resistance
+        level (plus buffer) sits TIGHTER than the ATR distance, the S/R level
+        is used instead - S/R can only tighten the stop, never widen it.
+
+        TP distance: confidence-based %, floored at min_risk_reward × SL.
+
+        (The old approach used the raw 20-bar low/high for SL, which could
+        sit 3-5% away: at 10x leverage a 5% stop-out is 50% of the margin
+        behind the trade, against a fixed 2% TP - inverted risk/reward.)
+        """
+        sl_distance, sl_basis = self._compute_sl_distance(
+            is_buy, entry_price, atr, support, resistance
+        )
 
         # TP distance by mode:
         # r_multiple - a fixed multiple of the SL distance. Closer targets

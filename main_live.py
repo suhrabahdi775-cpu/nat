@@ -146,6 +146,8 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         leverage=leverage,
 
         # Position sizing
+        sizing_mode=get_env_str('SIZING_MODE', 'risk'),
+        risk_per_trade_pct=get_env_float('RISK_PER_TRADE_PCT', '0.01'),
         base_usdt_amount=base_position,
         high_confidence_multiplier=get_env_float('HIGH_CONFIDENCE_MULTIPLIER', '1.5'),
         medium_confidence_multiplier=get_env_float('MEDIUM_CONFIDENCE_MULTIPLIER', '1.0'),
@@ -254,12 +256,21 @@ def get_binance_config() -> tuple:
     if not api_key or not api_secret:
         raise ValueError("BINANCE_API_KEY and BINANCE_API_SECRET required in .env")
 
+    # Load ONLY the instrument we trade.
+    # load_all=True pulls every Binance futures instrument AND re-loads them
+    # hourly. Binance recently added "TRADIFI_PERPETUAL" contracts (tokenized
+    # stocks: GMEUSDT, RIVNUSDT, ADBEUSDT, ...) that this nautilus_trader
+    # version cannot parse, spamming ~122 warnings/hour and churning the
+    # instrument set on every reload. Scoping to BTCUSDT-PERP removes that
+    # entire failure surface - we only ever trade this one instrument.
+    instrument_ids = frozenset(["BTCUSDT-PERP.BINANCE"])
+
     # Data client config
     data_config = BinanceDataClientConfig(
         api_key=api_key,
         api_secret=api_secret,
         account_type=BinanceAccountType.USDT_FUTURES,  # Binance Futures
-        instrument_provider=InstrumentProviderConfig(load_all=True),
+        instrument_provider=InstrumentProviderConfig(load_ids=instrument_ids),
     )
 
     # Execution client config
@@ -267,7 +278,7 @@ def get_binance_config() -> tuple:
         api_key=api_key,
         api_secret=api_secret,
         account_type=BinanceAccountType.USDT_FUTURES,
-        instrument_provider=InstrumentProviderConfig(load_all=True),
+        instrument_provider=InstrumentProviderConfig(load_ids=instrument_ids),
     )
 
     return data_config, exec_config

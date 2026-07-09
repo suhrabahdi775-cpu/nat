@@ -154,6 +154,7 @@ def test_actual_strategy_position_sizing():
         equity=400.0,
         leverage=10.0,
         base_usdt_amount=100.0,
+        sizing_mode="notional",   # this test targets the notional-mode rounding path
         use_rule_based_analyzer=True,
         prefetch_bars=False,
         use_account_balance=False,
@@ -162,7 +163,7 @@ def test_actual_strategy_position_sizing():
     ))
 
     quantity = strategy._calculate_position_size(
-        {'confidence': 'MEDIUM'},
+        {'confidence': 'MEDIUM', 'signal': 'BUY'},
         {'price': 90303.60},
         {'overall_trend': '震荡整理', 'rsi': 55.0},
         None,

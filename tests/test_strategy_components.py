@@ -37,31 +37,31 @@ def make_strategy(**overrides) -> DeepSeekAIStrategy:
 PRICE = {"price": 100_000.0}
 
 
-# ---------- Position sizing ----------
+# ---------- Position sizing: notional mode (legacy) ----------
 
 def test_sizing_scales_with_confidence():
-    """HIGH confidence must produce a larger position than MEDIUM."""
-    s = make_strategy()
+    """HIGH confidence must produce a larger position than MEDIUM (notional mode)."""
+    s = make_strategy(sizing_mode="notional")
     high = s._calculate_position_size(
-        {"confidence": "HIGH"}, PRICE,
+        {"confidence": "HIGH", "signal": "BUY"}, PRICE,
         {"overall_trend": "强势上涨", "rsi": 55.0}, None,
     )
     medium = s._calculate_position_size(
-        {"confidence": "MEDIUM"}, PRICE,
+        {"confidence": "MEDIUM", "signal": "BUY"}, PRICE,
         {"overall_trend": "震荡整理", "rsi": 55.0}, None,
     )
     assert high > medium > 0, f"HIGH {high} must exceed MEDIUM {medium}"
 
 
 def test_sizing_reduces_at_extreme_rsi():
-    """Extreme RSI must shrink the position."""
-    s = make_strategy()
+    """Extreme RSI must shrink the position (notional mode)."""
+    s = make_strategy(sizing_mode="notional")
     normal = s._calculate_position_size(
-        {"confidence": "HIGH"}, PRICE,
+        {"confidence": "HIGH", "signal": "BUY"}, PRICE,
         {"overall_trend": "强势上涨", "rsi": 55.0}, None,
     )
     extreme = s._calculate_position_size(
-        {"confidence": "HIGH"}, PRICE,
+        {"confidence": "HIGH", "signal": "BUY"}, PRICE,
         {"overall_trend": "强势上涨", "rsi": 80.0}, None,
     )
     assert extreme < normal
@@ -69,12 +69,59 @@ def test_sizing_reduces_at_extreme_rsi():
 
 def test_sizing_skips_below_min_notional():
     """Sizes below the exchange minimum must SKIP, never round up past risk caps."""
-    s = make_strategy()
+    s = make_strategy(sizing_mode="notional")
     qty = s._calculate_position_size(
-        {"confidence": "LOW"}, PRICE,  # 100 × 0.5 = $50 < $100 minimum
+        {"confidence": "LOW", "signal": "BUY"}, PRICE,  # 100 × 0.5 = $50 < $100 minimum
         {"overall_trend": "震荡整理", "rsi": 55.0}, None,
     )
     assert qty == 0.0
+
+
+# ---------- Position sizing: risk mode (default) ----------
+
+def test_risk_sizing_consistent_across_volatility():
+    """Same risk-at-stop regardless of ATR: tight stop -> big size, wide -> small."""
+    s = make_strategy(sizing_mode="risk", risk_per_trade_pct=0.01,
+                      equity=5000.0, max_position_ratio=1.0)
+    price = {"price": 100_000.0}
+    results = {}
+    for atr in (150.0, 600.0):
+        tech = {"overall_trend": "震荡整理", "rsi": 55.0, "atr": atr,
+                "support": 0.0, "resistance": 0.0}
+        qty = s._calculate_position_size({"confidence": "MEDIUM", "signal": "BUY"},
+                                         price, tech, None)
+        sl, _ = s._compute_sl_distance(True, price["price"], atr, 0.0, 0.0)
+        results[atr] = qty * sl  # risk-at-stop in USD
+    # Both should risk ~1% of 5000 = ~$50, within rounding tolerance
+    assert abs(results[150.0] - 50.0) < 8, results
+    assert abs(results[600.0] - 50.0) < 8, results
+    # Tight-stop position (150) must be LARGER in notional than wide-stop (600)
+    # -> verified implicitly: same risk, tighter stop => bigger size
+
+
+def test_risk_sizing_tight_stop_bigger_than_wide():
+    """Tighter stop must yield a larger notional at equal risk."""
+    s = make_strategy(sizing_mode="risk", equity=5000.0, max_position_ratio=1.0)
+    price = {"price": 100_000.0}
+    tight = s._calculate_position_size(
+        {"confidence": "MEDIUM", "signal": "BUY"}, price,
+        {"overall_trend": "震荡整理", "rsi": 55.0, "atr": 150.0}, None)
+    wide = s._calculate_position_size(
+        {"confidence": "MEDIUM", "signal": "BUY"}, price,
+        {"overall_trend": "震荡整理", "rsi": 55.0, "atr": 600.0}, None)
+    assert tight > wide > 0
+
+
+def test_risk_sizing_respects_margin_cap():
+    """Even a very tight stop cannot exceed the margin cap."""
+    s = make_strategy(sizing_mode="risk", equity=500.0, max_position_ratio=0.10,
+                      risk_per_trade_pct=0.05)
+    price = {"price": 100_000.0}
+    qty = s._calculate_position_size(
+        {"confidence": "HIGH", "signal": "BUY"}, price,
+        {"overall_trend": "强势上涨", "rsi": 55.0, "atr": 100.0}, None)
+    max_notional = 500.0 * 0.10 * 10.0
+    assert qty * price["price"] <= max_notional + 1e-9
 
 
 def test_sizing_respects_margin_risk_cap():
@@ -271,10 +318,10 @@ def _fake_close_event(pnl_side="LONG", entry=100_000.0):
 
 
 def test_loss_streak_throttles_size():
-    """After 2 consecutive losses, size must shrink (here: below min → skip)."""
-    s = make_strategy()
+    """After 2 consecutive losses, size must shrink (notional mode: below min → skip)."""
+    s = make_strategy(sizing_mode="notional")
     args = (
-        {"confidence": "HIGH"}, PRICE,
+        {"confidence": "HIGH", "signal": "BUY"}, PRICE,
         {"overall_trend": "强势上涨", "rsi": 55.0}, None,
     )
     normal = s._calculate_position_size(*args)
@@ -287,6 +334,19 @@ def test_loss_streak_throttles_size():
 
     s.consecutive_losses = 0
     assert s._calculate_position_size(*args) == normal
+
+
+def test_loss_streak_throttles_size_risk_mode():
+    """Risk mode: streak throttle halves the risked amount (size shrinks, not necessarily to 0)."""
+    s = make_strategy(sizing_mode="risk", equity=5000.0, max_position_ratio=1.0)
+    args = (
+        {"confidence": "HIGH", "signal": "BUY"}, {"price": 100_000.0},
+        {"overall_trend": "强势上涨", "rsi": 55.0, "atr": 200.0}, None,
+    )
+    normal = s._calculate_position_size(*args)
+    s.consecutive_losses = 2
+    throttled = s._calculate_position_size(*args)
+    assert 0 < throttled < normal
 
 
 def test_consecutive_losses_tracking():
