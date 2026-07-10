@@ -84,6 +84,7 @@ def run_one(bars_15m, bars_1h, equity, base_position, **params) -> dict:
         base_usdt_amount=base_position,
         use_rule_based_analyzer=True,
         prefetch_bars=False,
+        analysis_source="websocket",
         use_order_emulation=False,
         sentiment_enabled=False,
         enable_telegram=False,

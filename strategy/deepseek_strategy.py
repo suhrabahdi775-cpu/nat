@@ -167,6 +167,15 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     # Analysis trigger: on bar close (fresh data) vs wall-clock timer
     analyze_on_bar_close: bool = True
 
+    # Data source for analysis:
+    # "rest"      - poll Binance REST klines on a timer and rebuild indicators
+    #               each cycle. RELIABLE: the kline WebSocket push via the
+    #               nautilus Binance adapter has been observed to silently
+    #               stop delivering bars (bot ran 16h, subscribed, received
+    #               zero bars -> zero trades). REST always returns fresh bars.
+    # "websocket" - event-driven on live bars (subject to that flakiness).
+    analysis_source: str = "rest"
+
     # Analyzer: rule-based (deterministic, no API) for backtesting
     use_rule_based_analyzer: bool = False
 
@@ -341,8 +350,9 @@ class DeepSeekAIStrategy(Strategy):
         # Sizing source
         self.use_account_balance = config.use_account_balance
 
-        # Analysis trigger mode
+        # Analysis trigger mode / data source
         self.analyze_on_bar_close = config.analyze_on_bar_close
+        self.analysis_source = config.analysis_source
 
         # Track SL/TP prices for the live position (used to re-sync
         # protection orders after adds/reduces/partial fills)
@@ -396,17 +406,8 @@ class DeepSeekAIStrategy(Strategy):
         # }
 
         # Technical indicators manager
-        sma_periods = config.sma_periods if config.sma_periods else [5, 20, 50]
-        self.indicator_manager = TechnicalIndicatorManager(
-            sma_periods=sma_periods,
-            ema_periods=[config.macd_fast, config.macd_slow],
-            rsi_period=config.rsi_period,
-            macd_fast=config.macd_fast,
-            macd_slow=config.macd_slow,
-            bb_period=config.bb_period,
-            bb_std=config.bb_std,
-            atr_period=config.atr_period,
-        )
+        self._sma_periods = config.sma_periods if config.sma_periods else [5, 20, 50]
+        self.indicator_manager = self._build_indicator_manager()
 
         # Analyzer: rule-based (offline), cached DeepSeek (backtest
         # measurement), or live DeepSeek
@@ -577,32 +578,42 @@ class DeepSeekAIStrategy(Strategy):
         if self.config.prefetch_bars:
             self._prefetch_historical_bars(limit=200)
 
-        # Subscribe to bars (live data)
-        self.subscribe_bars(self.bar_type)
-        self.log.info(f"Subscribed to {self.bar_type}")
-
-        # Subscribe to higher-timeframe bars for the trend filter
-        if self.enable_htf_filter and self.htf_bar_type is not None:
-            if self.config.prefetch_bars:
-                self._prefetch_htf_bars(limit=200)
-            self.subscribe_bars(self.htf_bar_type)
-            self.log.info(f"Subscribed to HTF {self.htf_bar_type}")
-
-        # Analysis trigger: preferred mode runs on each closed primary bar
-        # (fresh data at every decision); the wall-clock timer remains as a
-        # configurable fallback (it can fire up to a full bar after close,
-        # making decisions on stale prices).
-        if self.analyze_on_bar_close:
-            self.log.info("Analysis mode: on bar close (event-driven)")
-        else:
+        if self.analysis_source == "rest":
+            # REST-polling mode: DO NOT subscribe to the (unreliable) kline
+            # WebSocket. Drive analysis from a timer that re-fetches fresh
+            # bars via REST each cycle. Backtests never use this path
+            # (backtest configs set analysis_source implicitly via the engine).
+            interval = max(60, self.config.timer_interval_sec)
             self.clock.set_timer(
                 name="analysis_timer",
-                interval=timedelta(seconds=self.config.timer_interval_sec),
+                interval=timedelta(seconds=interval),
                 callback=self.on_timer,
             )
             self.log.info(
-                f"Analysis mode: timer every {self.config.timer_interval_sec}s"
+                f"Analysis mode: REST polling every {interval}s "
+                f"(WebSocket bar push bypassed for reliability)"
             )
+        else:
+            # WebSocket mode (event-driven or timer)
+            self.subscribe_bars(self.bar_type)
+            self.log.info(f"Subscribed to {self.bar_type}")
+            if self.enable_htf_filter and self.htf_bar_type is not None:
+                if self.config.prefetch_bars:
+                    self._prefetch_htf_bars(limit=200)
+                self.subscribe_bars(self.htf_bar_type)
+                self.log.info(f"Subscribed to HTF {self.htf_bar_type}")
+
+            if self.analyze_on_bar_close:
+                self.log.info("Analysis mode: on bar close (event-driven)")
+            else:
+                self.clock.set_timer(
+                    name="analysis_timer",
+                    interval=timedelta(seconds=self.config.timer_interval_sec),
+                    callback=self.on_timer,
+                )
+                self.log.info(
+                    f"Analysis mode: timer every {self.config.timer_interval_sec}s"
+                )
 
         self.log.info("Strategy started successfully")
 
@@ -649,113 +660,142 @@ class DeepSeekAIStrategy(Strategy):
                 )
                 self.close_all_positions(self.instrument_id)
 
-        # Unsubscribe from data
-        self.unsubscribe_bars(self.bar_type)
-        if self.enable_htf_filter and self.htf_bar_type is not None:
-            self.unsubscribe_bars(self.htf_bar_type)
+        # Unsubscribe from data (only if we subscribed - REST mode does not)
+        if self.analysis_source != "rest":
+            self.unsubscribe_bars(self.bar_type)
+            if self.enable_htf_filter and self.htf_bar_type is not None:
+                self.unsubscribe_bars(self.htf_bar_type)
 
         self.log.info("Strategy stopped")
 
+    def _build_indicator_manager(self) -> TechnicalIndicatorManager:
+        """Create a fresh indicator manager with the configured parameters.
+
+        Used both at init and to rebuild state from a REST refresh (so the
+        REST-polling path recomputes indicators cleanly each cycle).
+        """
+        return TechnicalIndicatorManager(
+            sma_periods=self._sma_periods,
+            ema_periods=[self.config.macd_fast, self.config.macd_slow],
+            rsi_period=self.config.rsi_period,
+            macd_fast=self.config.macd_fast,
+            macd_slow=self.config.macd_slow,
+            bb_period=self.config.bb_period,
+            bb_std=self.config.bb_std,
+            atr_period=self.config.atr_period,
+        )
+
+    def _bar_interval(self) -> str:
+        """Binance interval string for the primary bar type.
+
+        Longest-token-first: '5-MINUTE' is a substring of '15-MINUTE', so a
+        naive check would mis-map 15m to 5m.
+        """
+        bar_type_str = str(self.bar_type)
+        for token, iv in [
+            ('15-MINUTE', '15m'), ('30-MINUTE', '30m'), ('5-MINUTE', '5m'),
+            ('3-MINUTE', '3m'), ('1-MINUTE', '1m'), ('12-HOUR', '12h'),
+            ('4-HOUR', '4h'), ('2-HOUR', '2h'), ('1-HOUR', '1h'), ('1-DAY', '1d'),
+        ]:
+            if token in bar_type_str:
+                return iv
+        return '15m'
+
+    def _fetch_klines(self, interval: str, limit: int = 200) -> list:
+        """Fetch raw klines from Binance Futures REST. Returns [] on failure."""
+        import requests
+        symbol = str(self.instrument_id).split('-')[0]
+        url = "https://fapi.binance.com/fapi/v1/klines"
+        response = requests.get(
+            url,
+            params={'symbol': symbol, 'interval': interval, 'limit': min(limit, 1500)},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _kline_to_bar(self, kline: list) -> Bar:
+        """Convert a raw Binance kline to a Nautilus Bar (primary bar type)."""
+        from nautilus_trader.core.datetime import millis_to_nanos
+        return Bar(
+            bar_type=self.bar_type,
+            open=self.instrument.make_price(float(kline[1])),
+            high=self.instrument.make_price(float(kline[2])),
+            low=self.instrument.make_price(float(kline[3])),
+            close=self.instrument.make_price(float(kline[4])),
+            volume=self.instrument.make_qty(float(kline[5])),
+            ts_event=millis_to_nanos(kline[0]),
+            ts_init=millis_to_nanos(kline[0]),
+        )
+
     def _prefetch_historical_bars(self, limit: int = 200):
-        """
-        Pre-fetch historical bars from Binance API on startup.
-
-        This eliminates the waiting period for indicators to initialize by loading
-        historical data directly from Binance exchange on strategy startup.
-
-        Parameters
-        ----------
-        limit : int
-            Number of historical bars to fetch (default: 200)
-        """
+        """Warm indicators from REST klines at startup (feeds the manager)."""
         try:
-            import requests
-            from nautilus_trader.core.datetime import millis_to_nanos
-
-            # Extract symbol from instrument_id
-            # Example: BTCUSDT-PERP.BINANCE -> BTCUSDT
-            symbol_str = str(self.instrument_id)
-            symbol = symbol_str.split('-')[0]
-
-            # Convert bar type to Binance interval.
-            # IMPORTANT: match longest tokens first. Substring checks are
-            # unsafe here - '5-MINUTE' is a substring of '15-MINUTE', so a
-            # naive '5-MINUTE' check would (and did) mis-map 15m bars to 5m,
-            # warming the indicators with the wrong-resolution history.
-            bar_type_str = str(self.bar_type)
-            interval_map = [
-                ('15-MINUTE', '15m'),
-                ('30-MINUTE', '30m'),
-                ('5-MINUTE', '5m'),
-                ('3-MINUTE', '3m'),
-                ('1-MINUTE', '1m'),
-                ('12-HOUR', '12h'),
-                ('4-HOUR', '4h'),
-                ('2-HOUR', '2h'),
-                ('1-HOUR', '1h'),
-                ('1-DAY', '1d'),
-            ]
-            interval = '5m'  # Default fallback
-            for token, iv in interval_map:
-                if token in bar_type_str:
-                    interval = iv
-                    break
-
+            interval = self._bar_interval()
             self.log.info(
                 f"📡 Pre-fetching {limit} historical bars from Binance "
-                f"(symbol={symbol}, interval={interval})..."
+                f"(interval={interval})..."
             )
-
-            # Binance Futures API endpoint
-            url = "https://fapi.binance.com/fapi/v1/klines"
-            params = {
-                'symbol': symbol,
-                'interval': interval,
-                'limit': min(limit, 1500),  # Binance max
-            }
-
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            klines = response.json()
-
+            klines = self._fetch_klines(interval, limit)
             if not klines:
                 self.log.warning("⚠️ No bars received from Binance API")
                 return
-
             self.log.info(f"📊 Received {len(klines)} bars from Binance")
-
-            # Convert to NautilusTrader bars and feed to indicators
             bars_fed = 0
             for kline in klines:
                 try:
-                    # Create Bar object
-                    bar = Bar(
-                        bar_type=self.bar_type,
-                        open=self.instrument.make_price(float(kline[1])),
-                        high=self.instrument.make_price(float(kline[2])),
-                        low=self.instrument.make_price(float(kline[3])),
-                        close=self.instrument.make_price(float(kline[4])),
-                        volume=self.instrument.make_qty(float(kline[5])),
-                        ts_event=millis_to_nanos(kline[0]),
-                        ts_init=millis_to_nanos(kline[0]),
-                    )
-
-                    # Feed to indicator manager
-                    self.indicator_manager.update(bar)
+                    self.indicator_manager.update(self._kline_to_bar(kline))
                     bars_fed += 1
-
                 except Exception as e:
                     self.log.warning(f"Failed to convert kline to bar: {e}")
-                    continue
-
             self.log.info(
-                f"✅ Pre-fetched {bars_fed} bars successfully! "
+                f"✅ Pre-fetched {bars_fed} bars! "
                 f"Indicators ready: {self.indicator_manager.is_initialized()}"
             )
-
         except Exception as e:
             self.log.error(f"❌ Failed to pre-fetch bars from Binance: {e}")
-            self.log.warning("Continuing with live bars only...")
+
+    def _rebuild_from_rest(self) -> bool:
+        """
+        Rebuild ALL indicator state from a fresh REST kline pull.
+
+        Excludes the in-progress (still-open) candle so indicators reflect
+        only closed bars. This is the reliable analysis path - it does not
+        depend on the flaky kline WebSocket push. Returns True on success.
+        """
+        try:
+            klines = self._fetch_klines(self._bar_interval(), 200)
+            if not klines or len(klines) < 2:
+                self.log.warning("⚠️ REST returned no/insufficient klines this cycle")
+                return False
+
+            # Drop the last (in-progress) candle - only trade on closed bars
+            closed = klines[:-1]
+
+            mgr = self._build_indicator_manager()
+            for kline in closed:
+                mgr.update(self._kline_to_bar(kline))
+            self.indicator_manager = mgr
+
+            # Rebuild HTF (1h) trend from REST too
+            if self.enable_htf_filter:
+                htf_klines = self._fetch_klines('1h', 200)
+                if htf_klines and len(htf_klines) >= 2:
+                    self.htf_sma_fast = SimpleMovingAverage(self.config.htf_sma_fast)
+                    self.htf_sma_slow = SimpleMovingAverage(self.config.htf_sma_slow)
+                    for k in htf_klines[:-1]:
+                        c = float(k[4])
+                        self.htf_sma_fast.update_raw(c)
+                        self.htf_sma_slow.update_raw(c)
+                        self.htf_last_close = c
+
+            # Advance the bar counter (cooldown/age/streak logic is in units
+            # of analysis cycles ≈ closed bars)
+            self.bars_received += 1
+            return True
+        except Exception as e:
+            self.log.error(f"❌ REST rebuild failed this cycle: {e}")
+            return False
 
     def on_bar(self, bar: Bar):
         """
@@ -838,11 +878,16 @@ class DeepSeekAIStrategy(Strategy):
 
     def on_timer(self, event):
         """
-        Timer callback (fallback analysis mode).
+        Timer callback.
 
-        Called every timer_interval_sec seconds when analyze_on_bar_close
-        is disabled.
+        REST mode: re-fetch fresh bars via REST (reliable) and rebuild
+        indicators before analyzing. WebSocket-timer mode: analyze on the
+        bars delivered via on_bar.
         """
+        if self.analysis_source == "rest":
+            if not self._rebuild_from_rest():
+                self.log.warning("Skipping analysis cycle - REST refresh failed")
+                return
         self._run_analysis()
 
     def _run_analysis(self):

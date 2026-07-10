@@ -220,6 +220,10 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         # Analysis trigger: bar close (fresh data) vs legacy timer
         analyze_on_bar_close=get_env_str('ANALYZE_ON_BAR_CLOSE', 'true').lower() == 'true',
 
+        # Data source: 'rest' polls Binance REST klines (reliable); 'websocket'
+        # uses the kline push stream (observed to silently stop delivering).
+        analysis_source=get_env_str('ANALYSIS_SOURCE', 'rest'),
+
         # Execution
         position_adjustment_threshold=0.001,
 

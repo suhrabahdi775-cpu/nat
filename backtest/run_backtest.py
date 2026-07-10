@@ -137,6 +137,7 @@ def main():
         deepseek_cache_file=(args.cache_file if args.analyzer == "deepseek" else ""),
         deepseek_max_api_calls=args.max_api_calls,
         prefetch_bars=False,            # history comes from the engine
+        analysis_source="websocket",    # bars come from the backtest engine, not REST
         use_order_emulation=False,      # bars-only data starves the emulator
         sentiment_enabled=False,        # no live API calls in backtest
         enable_telegram=False,
