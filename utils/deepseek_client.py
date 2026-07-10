@@ -686,8 +686,10 @@ Remember: Be decisive but not reckless. Quality over quantity.
 
         self._log_debug(f"📊 Signal Stats: {signal} (appeared {signal_count}/{total} times in recent history)")
 
-        # Check for consecutive same signals
+        # Check for consecutive same signals. This is informational only
+        # (repeated HOLD is normal - the AI holds most bars), so log at DEBUG
+        # to avoid it reading as an error/warning in the live logs.
         if len(self.signal_history) >= 3:
             last_three = [s['signal'] for s in self.signal_history[-3:]]
             if len(set(last_three)) == 1:
-                self._log_warning(f"⚠️ Warning: 3 consecutive {signal} signals")
+                self._log_debug(f"ℹ️ {signal} signal for 3 consecutive cycles")
