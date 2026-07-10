@@ -171,8 +171,9 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         deepseek_temperature=0.1,
         deepseek_max_retries=2,
 
-        # Sentiment
-        sentiment_enabled=True,
+        # Sentiment (off by default - CryptoOracle endpoint has been
+        # unreliable/timing out; the AI runs on technicals when absent)
+        sentiment_enabled=get_env_str('SENTIMENT_ENABLED', 'false').lower() == 'true',
         sentiment_lookback_hours=4,
         # Set sentiment timeframe based on bar timeframe (default to 15m)
         sentiment_timeframe="1m" if timeframe == "1m" else ("5m" if timeframe == "5m" else "15m"),
