@@ -548,6 +548,8 @@ class DeepSeekAIStrategy(Strategy):
             self.sentiment_fetcher = SentimentDataFetcher(
                 lookback_hours=config.sentiment_lookback_hours,
                 timeframe=sentiment_tf,
+                timeout=5.0,
+                logger=self.log,
             )
             self.log.info(f"Sentiment fetcher initialized with timeframe: {sentiment_tf}")
         else:

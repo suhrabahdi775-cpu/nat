@@ -5,6 +5,7 @@ Fetches market sentiment indicators from CryptoOracle API.
 """
 
 import os
+import time
 
 import requests
 from typing import Dict, Any, Optional
@@ -16,6 +17,11 @@ class SentimentDataFetcher:
     Fetches BTC market sentiment data from CryptoOracle API.
 
     Provides positive/negative sentiment ratios and net sentiment scores.
+
+    Sentiment is OPTIONAL context (the AI prompt explicitly handles it being
+    unavailable). This fetcher is therefore built to fail fast and quietly:
+    a short timeout, and negative-cache backoff so a slow/unreachable
+    endpoint does not block the analysis cycle every 15 minutes.
     """
 
     API_URL = "https://service.cryptoracle.network/openapi/v2/endpoint"
@@ -26,7 +32,8 @@ class SentimentDataFetcher:
         # hardcode API keys in the repo
         return os.getenv("CRYPTORACLE_API_KEY", "")
 
-    def __init__(self, lookback_hours: int = 4, timeframe: str = "15m"):
+    def __init__(self, lookback_hours: int = 4, timeframe: str = "15m",
+                 timeout: float = 5.0, logger=None):
         """
         Initialize sentiment data fetcher.
 
@@ -36,9 +43,27 @@ class SentimentDataFetcher:
             How many hours of historical data to fetch (default: 4)
         timeframe : str
             Time interval for data (default: "15m")
+        timeout : float
+            HTTP timeout in seconds (default: 5 - fail fast; sentiment is
+            optional and must not stall the trading loop)
+        logger : optional
+            NautilusTrader logger (self.log). Falls back to print().
         """
         self.lookback_hours = lookback_hours
         self.timeframe = timeframe
+        self.timeout = timeout
+        self._log = logger
+        # Negative-cache backoff: skip calls for a while after failures so a
+        # dead endpoint doesn't cost `timeout` seconds every single cycle.
+        self._consecutive_failures = 0
+        self._last_attempt = 0.0
+        self._backoff_base = 900.0  # 15 min per failure, capped at 1h
+
+    def _warn(self, msg: str):
+        if self._log:
+            self._log.warning(msg)
+        else:
+            print(msg)
 
     def fetch(self, token: str = "BTC") -> Optional[Dict[str, Any]]:
         """
@@ -62,8 +87,16 @@ class SentimentDataFetcher:
             }
         """
         if not self.API_KEY:
-            print("⚠️ CRYPTORACLE_API_KEY not set - sentiment data disabled")
-            return None
+            return None  # sentiment simply disabled; the AI handles its absence
+
+        # Negative-cache backoff: after failures, wait before retrying so a
+        # slow/unreachable endpoint doesn't block the loop each cycle.
+        now = time.time()
+        if self._consecutive_failures > 0:
+            backoff = min(self._backoff_base * self._consecutive_failures, 3600)
+            if (now - self._last_attempt) < backoff:
+                return None
+        self._last_attempt = now
 
         try:
             # Calculate time range
@@ -85,20 +118,34 @@ class SentimentDataFetcher:
                 "X-API-KEY": self.API_KEY
             }
 
-            # Make request with timeout to prevent hanging
-            response = requests.post(self.API_URL, json=request_body, headers=headers, timeout=10)
+            # Make request with a short timeout to prevent stalling the loop
+            response = requests.post(
+                self.API_URL, json=request_body, headers=headers, timeout=self.timeout
+            )
 
             if response.status_code == 200:
                 data = response.json()
 
                 if data.get("code") == 200 and data.get("data"):
+                    self._consecutive_failures = 0  # success resets backoff
                     return self._parse_sentiment_data(data)
 
-            print(f"⚠️ CryptoOracle API returned unexpected response: {response.status_code}")
+            self._consecutive_failures += 1
+            self._warn(
+                f"⚠️ CryptoOracle unexpected response {response.status_code} "
+                f"- continuing without sentiment (backing off)"
+            )
             return None
 
         except Exception as e:
-            print(f"❌ Sentiment data fetch failed: {e}")
+            self._consecutive_failures += 1
+            # Only log the first couple of failures to avoid spamming; after
+            # that the backoff mostly suppresses attempts anyway.
+            if self._consecutive_failures <= 2:
+                self._warn(
+                    f"⚠️ Sentiment fetch failed ({type(e).__name__}) - continuing "
+                    f"without sentiment. Backing off {int(self._backoff_base/60)}min×failures."
+                )
             return None
 
     def _parse_sentiment_data(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
