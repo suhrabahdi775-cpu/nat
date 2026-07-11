@@ -193,6 +193,13 @@ class TechnicalIndicatorManager:
         # Support and Resistance
         support, resistance = self._calculate_support_resistance()
 
+        # Efficiency ratio (Kaufman): |net move| / sum(|bar-to-bar moves|)
+        # over the lookback. ~1.0 = clean trend, ~0.0 = directionless chop.
+        # ATR alone cannot distinguish these: a violent RANGING market has
+        # high ATR but near-zero efficiency - and that is exactly the regime
+        # where trend-following entries whipsaw (observed live 2026-07-10).
+        efficiency_ratio = self._calculate_efficiency_ratio(period=20)
+
         # Trend analysis
         trend_data = self._analyze_trend(
             current_price, sma_values, macd_value, macd_signal_value
@@ -219,6 +226,8 @@ class TechnicalIndicatorManager:
             "volume_ratio": volume_ratio,
             # ATR (0.0 until initialized)
             "atr": self.atr.value if self.atr.initialized else 0.0,
+            # Trend efficiency (1.0 trend / 0.0 chop)
+            "efficiency_ratio": efficiency_ratio,
             # Support/Resistance
             "support": support,
             "resistance": resistance,
@@ -237,6 +246,15 @@ class TechnicalIndicatorManager:
         mean = sum(recent_closes) / len(recent_closes)
         variance = sum((x - mean) ** 2 for x in recent_closes) / len(recent_closes)
         return variance ** 0.5
+
+    def _calculate_efficiency_ratio(self, period: int = 20) -> float:
+        """Kaufman efficiency ratio over the last `period` closed bars."""
+        if len(self.recent_bars) < period + 1:
+            return 0.0
+        closes = [float(b.close) for b in self.recent_bars[-(period + 1):]]
+        net_move = abs(closes[-1] - closes[0])
+        path = sum(abs(closes[i] - closes[i - 1]) for i in range(1, len(closes)))
+        return net_move / path if path > 0 else 0.0
 
     def _calculate_support_resistance(self) -> tuple:
         """Calculate support and resistance levels."""

@@ -507,6 +507,7 @@ Remember: Be decisive but not reckless. Quality over quantity.
 └─ MACD Direction: {technical_data.get('macd_trend', 'N/A')}
 
 📊 Momentum Indicators:
+├─ Trend Efficiency: {safe_float(technical_data.get('efficiency_ratio')):.2f} ({'🟢 trending' if safe_float(technical_data.get('efficiency_ratio')) > 0.4 else '🔴 CHOPPY - avoid trend entries' if safe_float(technical_data.get('efficiency_ratio')) < 0.25 else '⚪ mixed'})
 ├─ ATR(volatility): {safe_float(technical_data.get('atr')):.2f}
 ├─ RSI: {safe_float(technical_data.get('rsi')):.2f} ({'🔴 Overbought (>70)' if safe_float(technical_data.get('rsi')) > 70 else '🟢 Oversold (<30)' if safe_float(technical_data.get('rsi')) < 30 else '⚪ Neutral (30-70)'})
 ├─ MACD Line: {safe_float(technical_data.get('macd')):.4f}

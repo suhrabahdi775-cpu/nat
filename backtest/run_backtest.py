@@ -39,7 +39,7 @@ from nautilus_trader.model.enums import AccountType, OmsType
 from nautilus_trader.model.identifiers import TraderId, Venue
 from nautilus_trader.model.objects import Money
 from nautilus_trader.persistence.wranglers import BarDataWrangler
-from nautilus_trader.test_kit.providers import TestInstrumentProvider
+from backtest.instrument import btcusdt_perp_real_fees
 
 from strategy.deepseek_strategy import DeepSeekAIStrategy, DeepSeekAIStrategyConfig
 
@@ -103,7 +103,7 @@ def main():
     )
 
     # --- Instrument (matches the live instrument ID exactly) ---
-    instrument = TestInstrumentProvider.btcusdt_perp_binance()
+    instrument = btcusdt_perp_real_fees()
     engine.add_instrument(instrument)
 
     # --- Data ---

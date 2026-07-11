@@ -206,10 +206,12 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         max_position_age_bars=get_env_int('MAX_POSITION_AGE_BARS', '24'),
         reversal_confirmation_signals=get_env_int('REVERSAL_CONFIRMATION_SIGNALS', '2'),
         min_atr_pct_to_trade=get_env_float('MIN_ATR_PCT_TO_TRADE', '0.001'),
+        min_efficiency_ratio=get_env_float('MIN_EFFICIENCY_RATIO', '0.25'),
+        max_signal_staleness_pct=get_env_float('MAX_SIGNAL_STALENESS_PCT', '0.0015'),
 
-        # TP mode and HTF strictness (defaults OOS-validated on real data)
+        # TP mode and HTF strictness (re-validated July 2026 under REAL fees)
         tp_mode=get_env_str('TP_MODE', 'r_multiple'),
-        tp_r_multiple=get_env_float('TP_R_MULTIPLE', '1.0'),
+        tp_r_multiple=get_env_float('TP_R_MULTIPLE', '2.0'),
         htf_strict_alignment=get_env_str('HTF_STRICT_ALIGNMENT', 'true').lower() == 'true',
 
         # Live-safety: flatten on stop (emulated SL/TP die with the process);

@@ -31,7 +31,7 @@ from nautilus_trader.model.enums import AccountType, OmsType
 from nautilus_trader.model.identifiers import TraderId, Venue
 from nautilus_trader.model.objects import Money
 from nautilus_trader.persistence.wranglers import BarDataWrangler
-from nautilus_trader.test_kit.providers import TestInstrumentProvider
+from backtest.instrument import btcusdt_perp_real_fees
 
 from strategy.deepseek_strategy import DeepSeekAIStrategy, DeepSeekAIStrategyConfig
 
@@ -41,10 +41,13 @@ from strategy.deepseek_strategy import DeepSeekAIStrategy, DeepSeekAIStrategyCon
 # NOTE: at low-volatility regimes (15m ATR ~0.1% of price) the ATR multiplier
 # is dominated by the min_sl_pct clamp - sweeping it changes nothing. Sweep
 # the binding parameters instead: the SL floor itself and the exit timing.
+# Current question (July 2026): does the 1R target profile survive REAL
+# fees (taker 0.05%, not the 0.018% the old runs modeled), and does the
+# efficiency-ratio chop filter earn its keep?
 GRID = {
     "tp_mode": ["r_multiple"],
-    "tp_r_multiple": [1.0, 1.5],
-    "htf_strict_alignment": [False, True],
+    "tp_r_multiple": [1.0, 1.5, 2.0],
+    "min_efficiency_ratio": [0.0, 0.25],
 }
 
 
@@ -71,7 +74,7 @@ def run_one(bars_15m, bars_1h, equity, base_position, **params) -> dict:
         base_currency=None,
         starting_balances=[Money(equity, USDT)],
     )
-    engine.add_instrument(TestInstrumentProvider.btcusdt_perp_binance())
+    engine.add_instrument(btcusdt_perp_real_fees())
     engine.add_data(bars_15m)
     if bars_1h:
         engine.add_data(bars_1h)
@@ -119,7 +122,7 @@ def child_run(args) -> None:
     """
     import json
 
-    instrument = TestInstrumentProvider.btcusdt_perp_binance()
+    instrument = btcusdt_perp_real_fees()
     bt_15m = BarType.from_str("BTCUSDT-PERP.BINANCE-15-MINUTE-LAST-EXTERNAL")
     bt_1h = BarType.from_str("BTCUSDT-PERP.BINANCE-1-HOUR-LAST-EXTERNAL")
 

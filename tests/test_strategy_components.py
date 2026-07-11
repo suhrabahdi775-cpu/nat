@@ -409,6 +409,35 @@ def test_reversal_confirmation_blocks_first_signal():
     assert s._opposite_signal_streak == 0
 
 
+# ---------- Efficiency ratio (chop detection) ----------
+
+def test_efficiency_ratio_trend_vs_chop():
+    """Trending closes -> ER near 1; oscillating closes -> ER near 0."""
+    from indicators.technical_manager import TechnicalIndicatorManager
+
+    class FakeBar:
+        def __init__(self, px):
+            self.open = self.high = self.low = self.close = px
+            self.volume = 100.0
+            self.ts_init = 0
+
+    trend = TechnicalIndicatorManager()
+    for i in range(30):
+        trend.update(FakeBar(100_000.0 + i * 100))  # straight line up
+    er_trend = trend._calculate_efficiency_ratio(period=20)
+
+    chop = TechnicalIndicatorManager()
+    for i in range(30):
+        chop.update(FakeBar(100_000.0 + (100 if i % 2 else -100)))  # sawtooth
+    er_chop = chop._calculate_efficiency_ratio(period=20)
+
+    assert er_trend > 0.9, f"trend ER {er_trend}"
+    assert er_chop < 0.1, f"chop ER {er_chop}"
+    # And it must be exposed in technical data
+    data = trend.get_technical_data(103_000.0)
+    assert "efficiency_ratio" in data
+
+
 # ---------- Rule-based analyzer ----------
 
 def test_rule_based_analyzer_deterministic():

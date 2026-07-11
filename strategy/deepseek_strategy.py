@@ -141,15 +141,30 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     # is below this (chop - fees eat any edge). 0 disables.
     min_atr_pct_to_trade: float = 0.001
 
+    # Chop filter: skip NEW entries when the Kaufman efficiency ratio is
+    # below this. ATR measures volatility, not direction - a violent ranging
+    # market passes the ATR filter but whipsaws trend entries. 0 disables.
+    min_efficiency_ratio: float = 0.25
+
+    # Stale-signal guard (live REST mode only): DeepSeek takes 30-70s to
+    # answer; with sub-0.5% targets an adverse move during the call ruins
+    # the trade geometry before entry. Re-check the price after the AI
+    # returns and skip the entry if it moved against the signal by more
+    # than this fraction. 0 disables.
+    max_signal_staleness_pct: float = 0.0015
+
     # Take-profit mode:
     # "confidence_pct" - TP = confidence-based % (1-3%) with min_risk_reward floor
     # "r_multiple"     - TP = tp_r_multiple × SL distance (closer targets,
     #                    higher win rate, smaller average win)
-    # Defaults validated out-of-sample on real Jan-Jun 2026 data:
-    # r_multiple=1.0 + strict HTF -> 52.5% win rate, positive PnL on the
-    # test window (vs 46.4% / negative for the previous defaults).
+    # Defaults re-validated July 2026 under REAL Binance fees (taker 0.05%,
+    # not the 0.018% the test instrument models): 1R targets cannot clear
+    # the 0.10% round-trip cost (breakeven win rate 66.7%); 2R targets +
+    # the efficiency-ratio chop filter were positive on BOTH train and test
+    # windows. The earlier 1R recommendation was an artifact of under-
+    # modeled fees.
     tp_mode: str = "r_multiple"
-    tp_r_multiple: float = 1.0
+    tp_r_multiple: float = 2.0
 
     # HTF strict alignment: entries must be WITH the 1h trend (BUY only in
     # UPTREND, SELL only in DOWNTREND; NEUTRAL blocks new entries).
@@ -339,6 +354,12 @@ class DeepSeekAIStrategy(Strategy):
 
         # Dead-market filter
         self.min_atr_pct_to_trade = config.min_atr_pct_to_trade
+
+        # Chop filter (efficiency ratio)
+        self.min_efficiency_ratio = config.min_efficiency_ratio
+
+        # Stale-signal guard
+        self.max_signal_staleness_pct = config.max_signal_staleness_pct
 
         # TP mode
         self.tp_mode = config.tp_mode
@@ -1253,6 +1274,48 @@ class DeepSeekAIStrategy(Strategy):
                     f"{self.min_atr_pct_to_trade:.3%} threshold - skipping entry"
                 )
                 return
+
+        # Chop filter: volatile-but-directionless markets whipsaw trend
+        # entries (ATR passes, efficiency doesn't - the live loss pattern)
+        if current_position is None and self.min_efficiency_ratio > 0:
+            er = technical_data.get('efficiency_ratio', 0.0)
+            if er < self.min_efficiency_ratio:
+                self.log.info(
+                    f"🌀 Choppy market: efficiency ratio {er:.2f} < "
+                    f"{self.min_efficiency_ratio:.2f} - skipping entry"
+                )
+                return
+
+        # Stale-signal guard (live REST mode): the analysis price is from
+        # BEFORE the 30-70s DeepSeek call. If price has since run in the
+        # signal direction beyond the threshold, entering now chases a worse
+        # price with SL/TP geometry computed for the old one - skip.
+        if (
+            current_position is None
+            and self.max_signal_staleness_pct > 0
+            and self.analysis_source == "rest"
+        ):
+            try:
+                latest = self._fetch_klines(self._bar_interval(), limit=1)
+                if latest:
+                    now_price = float(latest[-1][4])
+                    analysis_price = price_data['price']
+                    drift = (now_price - analysis_price) / analysis_price
+                    chasing = (signal == 'BUY' and drift > self.max_signal_staleness_pct) or (
+                        signal == 'SELL' and drift < -self.max_signal_staleness_pct
+                    )
+                    if chasing:
+                        self.log.info(
+                            f"⏱️ Stale signal: price moved {drift:+.2%} since analysis "
+                            f"(${analysis_price:,.2f} → ${now_price:,.2f}) - skipping "
+                            f"{signal} entry rather than chasing"
+                        )
+                        return
+                    # Use the fresher price for sizing/SL/TP geometry
+                    price_data['price'] = now_price
+                    self.latest_price_data = price_data
+            except Exception as e:
+                self.log.debug(f"Staleness check failed (proceeding): {e}")
 
         # Loss cooldown: block NEW entries for a few bars after a stop-out
         # (managing an existing position is still allowed)
