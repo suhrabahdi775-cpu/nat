@@ -126,9 +126,10 @@ def test_risk_sizing_respects_margin_cap():
 
 def test_sizing_respects_margin_risk_cap():
     """Notional must never exceed equity × ratio × leverage."""
-    s = make_strategy(base_usdt_amount=10_000.0)  # absurdly large base
+    s = make_strategy(base_usdt_amount=10_000.0,  # absurdly large base
+                      max_position_ratio=0.10)     # pin (don't depend on default)
     qty = s._calculate_position_size(
-        {"confidence": "HIGH"}, PRICE,
+        {"confidence": "HIGH", "signal": "BUY"}, PRICE,
         {"overall_trend": "强势上涨", "rsi": 55.0}, None,
     )
     max_notional = 500.0 * 0.10 * 10.0  # equity × ratio × leverage = $500
