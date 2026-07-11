@@ -1551,32 +1551,32 @@ class DeepSeekAIStrategy(Strategy):
                     return
             self._opposite_signal_streak = 0
 
-            self.log.info(f"🔄 Reversing position: {current_side} → {target_side}")
+            self.log.info(
+                f"🔄 Reversal signal: closing {current_side} position "
+                f"(re-enter {target_side} next cycle if the signal holds)"
+            )
 
-            # Cancel the old position's SL/TP orders FIRST - otherwise they
-            # linger and can fire against the new opposite position.
+            # Cancel the old position's SL/TP orders FIRST.
             self.cancel_all_orders(self.instrument_id)
-
-            # Clear stale trailing/protection state for the old position
             self.trailing_stop_state.pop(str(self.instrument_id), None)
             self.position_protection = {}
 
-            # Flag the reversal so on_position_closed (which fires for the
-            # old position AFTER the new bracket may already be submitted)
-            # does not cancel the new position's SL/TP or clear its state.
-            self._reversal_in_progress = True
-
-            # Close current position
+            # CLOSE-AND-WAIT: only close here; do NOT open the opposite in the
+            # same step. Submitting a reduce-only close AND a full bracket
+            # entry simultaneously races in a netting account and triggers
+            # Binance -2022 "ReduceOnly Order is rejected", leaving the
+            # reversal half-done (position closed at a loss, new side never
+            # cleanly established - observed live 2026-07-10). Re-entering on
+            # the NEXT cycle (once flat, if the opposite signal persists) is
+            # race-free and also cuts whipsaw: a one-bar counter-signal that
+            # reverses immediately tends to buy the top / sell the bottom.
             self._submit_order(
                 side=OrderSide.SELL if current_side == 'long' else OrderSide.BUY,
                 quantity=current_qty,
                 reduce_only=True,
             )
-
-            # Open opposite position WITH bracket SL/TP protection.
-            # (Previously this was a naked market order - an adverse move on
-            # a fresh reversal had no stop loss at all.)
-            self._open_new_position(target_side, target_quantity)
+            # Next cycle sees current_position=None and opens fresh via the
+            # normal (bracket-protected) entry path if the signal still holds.
 
         else:
             self.log.warning(
