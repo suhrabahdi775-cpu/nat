@@ -66,6 +66,10 @@ def main():
     parser.add_argument("--equity", type=float, default=500.0, help="Starting USDT balance")
     parser.add_argument("--leverage", type=float, default=10.0)
     parser.add_argument("--base-position", type=float, default=100.0, help="Base position notional (USDT)")
+    parser.add_argument("--risk-pct", type=float, default=None,
+                        help="Override risk_per_trade_pct (e.g. 0.02 = 2%% of equity per trade)")
+    parser.add_argument("--max-ratio", type=float, default=None,
+                        help="Override max_position_ratio (margin cap as fraction of equity)")
     parser.add_argument("--log-level", default="ERROR", help="Engine log level (ERROR keeps output readable)")
     parser.add_argument("--start", default=None, help="Window start date, e.g. 2026-06-24")
     parser.add_argument("--end", default=None, help="Window end date (exclusive)")
@@ -144,6 +148,8 @@ def main():
         enable_htf_filter=enable_htf,
         analyze_on_bar_close=True,
         use_account_balance=True,
+        **({"risk_per_trade_pct": args.risk_pct} if args.risk_pct is not None else {}),
+        **({"max_position_ratio": args.max_ratio} if args.max_ratio is not None else {}),
     )
     strategy = DeepSeekAIStrategy(config=config)
     engine.add_strategy(strategy)
@@ -177,8 +183,19 @@ def main():
         losses = (pnls < 0).sum()
         total = pnls.sum()
         win_rate = wins / max(wins + losses, 1) * 100
+        # Max drawdown on the cumulative realized-PnL curve (equity proxy)
+        equity_curve = args.equity + pnls.cumsum()
+        running_peak = equity_curve.cummax()
+        drawdown = (equity_curve - running_peak) / running_peak
+        max_dd = drawdown.min() * 100  # most negative
+        # Worst consecutive losing streak
+        streak = worst = 0
+        for p in pnls:
+            streak = streak + 1 if p < 0 else 0
+            worst = max(worst, streak)
         print(f"Win/Loss: {wins}/{losses} ({win_rate:.1f}% win rate)")
-        print(f"Total realized PnL: {total:+.2f} USDT")
+        print(f"Total realized PnL: {total:+.2f} USDT ({total/args.equity*100:+.1f}% of ${args.equity:.0f})")
+        print(f"Max drawdown: {max_dd:.1f}% | Worst losing streak: {worst}")
         if losses > 0 and wins > 0:
             avg_win = pnls[pnls > 0].mean()
             avg_loss = abs(pnls[pnls < 0].mean())

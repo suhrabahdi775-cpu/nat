@@ -47,7 +47,7 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     high_confidence_multiplier: float = 1.5
     medium_confidence_multiplier: float = 1.0
     low_confidence_multiplier: float = 0.5
-    max_position_ratio: float = 0.10
+    max_position_ratio: float = 0.20  # validated sweet spot; higher REDUCES
     trend_strength_multiplier: float = 1.2
     min_trade_amount: float = 0.001
 

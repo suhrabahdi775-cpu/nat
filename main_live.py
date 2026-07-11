@@ -152,7 +152,7 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         high_confidence_multiplier=get_env_float('HIGH_CONFIDENCE_MULTIPLIER', '1.5'),
         medium_confidence_multiplier=get_env_float('MEDIUM_CONFIDENCE_MULTIPLIER', '1.0'),
         low_confidence_multiplier=get_env_float('LOW_CONFIDENCE_MULTIPLIER', '0.5'),
-        max_position_ratio=get_env_float('MAX_POSITION_RATIO', '0.10'),
+        max_position_ratio=get_env_float('MAX_POSITION_RATIO', '0.20'),
         trend_strength_multiplier=get_env_float('TREND_STRENGTH_MULTIPLIER', '1.2'),
         min_trade_amount=0.001,  # Binance minimum
 
