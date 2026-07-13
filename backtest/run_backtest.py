@@ -72,6 +72,9 @@ def main():
                         help="Override max_position_ratio (margin cap as fraction of equity)")
     parser.add_argument("--partial-tp", choices=["on", "off"], default=None,
                         help="on = laddered partial TPs; off = single full-size bracket TP")
+    parser.add_argument("--partial-tp-levels", default=None,
+                        help='Ladder spec "pct:frac,pct:frac", e.g. "0.005:0.5,0.01:0.5" '
+                             '= 50%% off at +0.5%%, rest at +1%% (implies --partial-tp on)')
     parser.add_argument("--log-level", default="ERROR", help="Engine log level (ERROR keeps output readable)")
     parser.add_argument("--start", default=None, help="Window start date, e.g. 2026-06-24")
     parser.add_argument("--end", default=None, help="Window end date (exclusive)")
@@ -153,6 +156,16 @@ def main():
         **({"risk_per_trade_pct": args.risk_pct} if args.risk_pct is not None else {}),
         **({"max_position_ratio": args.max_ratio} if args.max_ratio is not None else {}),
         **({"enable_partial_tp": args.partial_tp == "on"} if args.partial_tp is not None else {}),
+        **(
+            {
+                "enable_partial_tp": True,
+                "partial_tp_levels": tuple(
+                    {"profit_pct": float(p.split(":")[0]), "position_pct": float(p.split(":")[1])}
+                    for p in args.partial_tp_levels.split(",")
+                ),
+            }
+            if args.partial_tp_levels else {}
+        ),
     )
     strategy = DeepSeekAIStrategy(config=config)
     engine.add_strategy(strategy)
