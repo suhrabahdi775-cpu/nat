@@ -207,6 +207,7 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         reversal_confirmation_signals=get_env_int('REVERSAL_CONFIRMATION_SIGNALS', '2'),
         min_atr_pct_to_trade=get_env_float('MIN_ATR_PCT_TO_TRADE', '0.001'),
         min_efficiency_ratio=get_env_float('MIN_EFFICIENCY_RATIO', '0.25'),
+        enable_partial_tp=get_env_str('ENABLE_PARTIAL_TP', 'false').lower() == 'true',
         max_signal_staleness_pct=get_env_float('MAX_SIGNAL_STALENESS_PCT', '0.0015'),
 
         # TP mode and HTF strictness (re-validated July 2026 under REAL fees)

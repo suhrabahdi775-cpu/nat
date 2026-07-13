@@ -224,7 +224,11 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     trailing_update_threshold_pct: float = 0.002
     
     # Partial Take Profit
-    enable_partial_tp: bool = True
+    # Default OFF: on 15m BTC the 2-4% partial targets are almost never hit
+    # (trades exit via trailing/breakeven/time), so the ladder gives IDENTICAL
+    # backtest results to a single full-size TP but adds reduce-only orders
+    # that caused live -2022 rejections. Single TP is simpler and more robust.
+    enable_partial_tp: bool = False
     partial_tp_levels: Tuple[Dict[str, float], ...] = (
         {"profit_pct": 0.02, "position_pct": 0.5},
         {"profit_pct": 0.04, "position_pct": 0.5},

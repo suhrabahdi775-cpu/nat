@@ -70,6 +70,8 @@ def main():
                         help="Override risk_per_trade_pct (e.g. 0.02 = 2%% of equity per trade)")
     parser.add_argument("--max-ratio", type=float, default=None,
                         help="Override max_position_ratio (margin cap as fraction of equity)")
+    parser.add_argument("--partial-tp", choices=["on", "off"], default=None,
+                        help="on = laddered partial TPs; off = single full-size bracket TP")
     parser.add_argument("--log-level", default="ERROR", help="Engine log level (ERROR keeps output readable)")
     parser.add_argument("--start", default=None, help="Window start date, e.g. 2026-06-24")
     parser.add_argument("--end", default=None, help="Window end date (exclusive)")
@@ -150,6 +152,7 @@ def main():
         use_account_balance=True,
         **({"risk_per_trade_pct": args.risk_pct} if args.risk_pct is not None else {}),
         **({"max_position_ratio": args.max_ratio} if args.max_ratio is not None else {}),
+        **({"enable_partial_tp": args.partial_tp == "on"} if args.partial_tp is not None else {}),
     )
     strategy = DeepSeekAIStrategy(config=config)
     engine.add_strategy(strategy)
