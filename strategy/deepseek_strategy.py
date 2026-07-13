@@ -1592,6 +1592,22 @@ class DeepSeekAIStrategy(Strategy):
 
         # Opposite direction - reverse position
         elif self.allow_reversals:
+            # Chop guard on REVERSALS (not just new entries). In a
+            # directionless market the signal flip-flops; reversing there
+            # closes a protected position and re-enters right as price
+            # whipsaws back - the exact churn seen live (28 reversal signals,
+            # cascading -2022 reduce-only rejections). When choppy, HOLD the
+            # current position (its SL/TP still protect it) instead of flipping.
+            if self.min_efficiency_ratio > 0:
+                er = (self.latest_technical_data or {}).get('efficiency_ratio', 1.0)
+                if er < self.min_efficiency_ratio:
+                    self.log.info(
+                        f"🌀 Choppy (ER {er:.2f} < {self.min_efficiency_ratio:.2f}) "
+                        f"- holding {current_side}, not reversing"
+                    )
+                    self._opposite_signal_streak = 0
+                    return
+
             # Check if high confidence required for reversal
             if self.require_high_conf_reversal and confidence != 'HIGH':
                 self.log.warning(
@@ -1988,7 +2004,23 @@ class DeepSeekAIStrategy(Strategy):
 
     def on_order_rejected(self, event):
         """Handle order rejected events."""
-        self.log.error(f"❌ Order rejected: {event.reason}")
+        reason = str(event.reason)
+        # -2022 / -4118 = reduce-only order rejected because the position is
+        # already flat (or smaller) on Binance. This is a benign state-sync
+        # lag from Binance's user-data stream, not a strategy fault -
+        # NautilusTrader's reconciliation resolves it. Log at INFO so it does
+        # not read as a hard error, and clear stale local protection state so
+        # we do not keep acting on a position that no longer exists.
+        if '-2022' in reason or '-4118' in reason or 'ReduceOnly' in reason:
+            self.log.info(
+                f"ℹ️ Reduce-only order rejected (position already flat/"
+                f"reconciling): {reason[:80]}"
+            )
+            if not self.cache.positions_open(instrument_id=self.instrument_id):
+                self.trailing_stop_state.pop(str(self.instrument_id), None)
+                self.position_protection = {}
+            return
+        self.log.error(f"❌ Order rejected: {reason}")
 
     def on_position_opened(self, event):
         """

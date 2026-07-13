@@ -24,7 +24,7 @@ class SentimentDataFetcher:
     endpoint does not block the analysis cycle every 15 minutes.
     """
 
-    API_URL = "https://service.cryptoracle.network/openapi/v2/endpoint"
+    API_URL = "https://service.cryptoracle.network/openapi/v2.1/endpoint/klines"
 
     @property
     def API_KEY(self) -> str:
