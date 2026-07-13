@@ -439,6 +439,42 @@ def test_efficiency_ratio_trend_vs_chop():
     assert "efficiency_ratio" in data
 
 
+# ---------- State-desync tripwire ----------
+
+def test_desync_tripwire_pauses_after_3_reduce_rejects():
+    """3 consecutive reduce-only rejects must pause trading; a fill resumes."""
+    from types import SimpleNamespace
+    s = make_strategy()
+
+    def reject():
+        return SimpleNamespace(reason="{'code': -2022, 'msg': 'ReduceOnly Order is rejected.'}")
+
+    s.on_order_rejected(reject())
+    s.on_order_rejected(reject())
+    assert not s._state_desync  # 2 rejects: not yet
+    s.on_order_rejected(reject())
+    assert s._state_desync      # 3rd trips the wire
+
+    # Desync blocks execution
+    called = []
+    s._open_new_position = lambda side, qty: called.append(1)
+    s._execute_trade(
+        {"signal": "BUY", "confidence": "HIGH"}, {"price": 100_000.0},
+        {"overall_trend": "强势上涨", "rsi": 55.0, "atr": 300.0,
+         "efficiency_ratio": 0.9, "htf_trend": "UPTREND"}, None,
+    )
+    assert not called
+
+    # A real fill clears it
+    fill = SimpleNamespace(
+        client_order_id="O-TEST", order_side=SimpleNamespace(name="BUY"),
+        last_qty=0.002, last_px=100_000.0,
+    )
+    s.on_order_filled(fill)
+    assert not s._state_desync
+    assert s._reduce_reject_streak == 0
+
+
 # ---------- Rule-based analyzer ----------
 
 def test_rule_based_analyzer_deterministic():

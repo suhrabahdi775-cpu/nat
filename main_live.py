@@ -332,8 +332,16 @@ def setup_trading_node() -> TradingNodeConfig:
         trader_id=TraderId("DeepSeekTrader-001"),
         logging=logging_config,
         exec_engine=LiveExecEngineConfig(
-            reconciliation=True,  # Enable position reconciliation
+            reconciliation=True,  # Startup position reconciliation
             inflight_check_interval_ms=5000,  # Check in-flight orders every 5s
+            # CONTINUOUS reconciliation (was disabled = None). Without it, a
+            # mid-run desync persists forever: observed live 2026-07-13, the
+            # Binance user-data stream went quiet, fills were "inferred"
+            # wrongly, and the bot managed a fantasy LONG for 15h while the
+            # exchange held a SHORT (21x -2022 rejects). These make the
+            # engine poll Binance REST for position/order truth periodically.
+            position_check_interval_secs=300.0,
+            open_check_interval_secs=300.0,
         ),
         # Data clients
         data_clients={

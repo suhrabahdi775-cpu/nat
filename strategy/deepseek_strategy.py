@@ -385,6 +385,14 @@ class DeepSeekAIStrategy(Strategy):
         self._pending_protection_refresh = False
         self._reversal_in_progress = False
 
+        # State-desync tripwire: repeated reduce-only rejects mean our cached
+        # position disagrees with the exchange (e.g. user-data stream died and
+        # fills were inferred wrongly). Trading on a fantasy position is worse
+        # than not trading - pause until a real fill/position event proves the
+        # state is live again (continuous reconciliation repairs it).
+        self._reduce_reject_streak = 0
+        self._state_desync = False
+
         # Signal snapshot taken at ENTRY time - the feedback loop must label
         # trades with the signal that opened them, not whatever signal was
         # current when they closed (a reversal-closed trade would otherwise
@@ -1218,6 +1226,15 @@ class DeepSeekAIStrategy(Strategy):
         if self.is_trading_paused:
             self.log.info("⏸️ Trading is paused - skipping signal execution")
             return
+
+        # State-desync tripwire: cached position provably disagrees with the
+        # exchange - any action would target a fantasy position
+        if self._state_desync:
+            self.log.error(
+                "🚨 Trading paused (position state desync) - awaiting "
+                "reconciliation or restart"
+            )
+            return
         
         # Store signal and technical data for SL/TP calculation
         self.latest_signal_data = signal_data
@@ -1986,6 +2003,12 @@ class DeepSeekAIStrategy(Strategy):
         """
         filled_order_id = str(event.client_order_id)
 
+        # A real fill proves order flow is live - clear the desync tripwire
+        self._reduce_reject_streak = 0
+        if self._state_desync:
+            self._state_desync = False
+            self.log.info("✅ State desync cleared by a real fill - trading resumed")
+
         self.log.info(
             f"✅ Order filled: {event.order_side.name} "
             f"{event.last_qty} @ {event.last_px} "
@@ -2016,11 +2039,33 @@ class DeepSeekAIStrategy(Strategy):
         # not read as a hard error, and clear stale local protection state so
         # we do not keep acting on a position that no longer exists.
         if '-2022' in reason or '-4118' in reason or 'ReduceOnly' in reason:
+            self._reduce_reject_streak += 1
+            if self._reduce_reject_streak >= 3 and not self._state_desync:
+                self._state_desync = True
+                self.log.error(
+                    f"🚨 POSITION STATE DESYNC: {self._reduce_reject_streak} "
+                    f"consecutive reduce-only rejects - cached position "
+                    f"disagrees with the exchange. Trading PAUSED until a "
+                    f"real fill/position event confirms state (continuous "
+                    f"reconciliation should repair it; otherwise restart the "
+                    f"bot and verify the position in the Binance app)."
+                )
+                if self.telegram_bot and self.enable_telegram:
+                    try:
+                        self.telegram_bot.send_message_sync(
+                            "🚨 Position state desync detected - trading paused. "
+                            "Verify position in Binance app; restart bot if needed."
+                        )
+                    except Exception:
+                        pass
+                return
             self.log.info(
                 f"ℹ️ Reduce-only order rejected (position already flat/"
                 f"reconciling): {reason[:80]}"
             )
-            if not self.cache.positions_open(instrument_id=self.instrument_id):
+            if self.cache is not None and not self.cache.positions_open(
+                instrument_id=self.instrument_id
+            ):
                 self.trailing_stop_state.pop(str(self.instrument_id), None)
                 self.position_protection = {}
             return
