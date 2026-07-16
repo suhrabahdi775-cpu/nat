@@ -181,7 +181,12 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         # Risk
         min_confidence_to_trade=get_env_str('MIN_CONFIDENCE_TO_TRADE', 'MEDIUM'),
         allow_reversals=True,
-        require_high_confidence_for_reversal=False,
+        # Only flip an open position on a HIGH-confidence opposite signal.
+        # MEDIUM signals flip-flop in chop and reverse-close at local extremes
+        # (e.g. 2026-07-16: covered a short at the bounce high, re-shorted
+        # lower for a churn loss). Backtest-neutral on the rule analyzer.
+        require_high_confidence_for_reversal=get_env_str(
+            'REQUIRE_HIGH_CONFIDENCE_FOR_REVERSAL', 'true').lower() == 'true',
         rsi_extreme_threshold_upper=75.0,
         rsi_extreme_threshold_lower=25.0,
         rsi_extreme_multiplier=0.7,
@@ -203,7 +208,7 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         enable_breakeven_stop=get_env_str('ENABLE_BREAKEVEN_STOP', 'true').lower() == 'true',
         daily_loss_limit_pct=get_env_float('DAILY_LOSS_LIMIT_PCT', '0.05'),
         loss_streak_threshold=get_env_int('LOSS_STREAK_THRESHOLD', '2'),
-        max_position_age_bars=get_env_int('MAX_POSITION_AGE_BARS', '24'),
+        max_position_age_bars=get_env_int('MAX_POSITION_AGE_BARS', '48'),
         reversal_confirmation_signals=get_env_int('REVERSAL_CONFIRMATION_SIGNALS', '2'),
         min_atr_pct_to_trade=get_env_float('MIN_ATR_PCT_TO_TRADE', '0.001'),
         min_efficiency_ratio=get_env_float('MIN_EFFICIENCY_RATIO', '0.25'),
@@ -327,22 +332,34 @@ def setup_trading_node() -> TradingNodeConfig:
         log_file_max_backup_count=3,   # Keep 3 backup files (total: 40MB max)
     )
 
+    # Exec-engine config. CONTINUOUS reconciliation (poll Binance REST for
+    # position/order truth every 5 min) repairs mid-run desync - observed
+    # live 2026-07-13 when the user-data stream went quiet and the bot
+    # managed a fantasy position for 15h. Those knobs only exist on newer
+    # nautilus_trader; build tolerantly so the bot still runs on older
+    # versions (the strategy-side desync tripwire protects either way).
+    exec_engine_kwargs = dict(
+        reconciliation=True,               # startup reconciliation
+        inflight_check_interval_ms=5000,   # check in-flight orders every 5s
+    )
+    for _k, _v in (("position_check_interval_secs", 300.0),
+                   ("open_check_interval_secs", 300.0)):
+        exec_engine_kwargs[_k] = _v
+    try:
+        exec_engine_config = LiveExecEngineConfig(**exec_engine_kwargs)
+    except TypeError:
+        for _k in ("position_check_interval_secs", "open_check_interval_secs"):
+            exec_engine_kwargs.pop(_k, None)
+        exec_engine_config = LiveExecEngineConfig(**exec_engine_kwargs)
+        print("⚠️  nautilus_trader lacks continuous-reconciliation knobs - "
+              "using startup reconciliation only. Upgrade nautilus_trader "
+              "for auto-heal; the desync tripwire still protects trading.")
+
     # Trading node config
     config = TradingNodeConfig(
         trader_id=TraderId("DeepSeekTrader-001"),
         logging=logging_config,
-        exec_engine=LiveExecEngineConfig(
-            reconciliation=True,  # Startup position reconciliation
-            inflight_check_interval_ms=5000,  # Check in-flight orders every 5s
-            # CONTINUOUS reconciliation (was disabled = None). Without it, a
-            # mid-run desync persists forever: observed live 2026-07-13, the
-            # Binance user-data stream went quiet, fills were "inferred"
-            # wrongly, and the bot managed a fantasy LONG for 15h while the
-            # exchange held a SHORT (21x -2022 rejects). These make the
-            # engine poll Binance REST for position/order truth periodically.
-            position_check_interval_secs=300.0,
-            open_check_interval_secs=300.0,
-        ),
+        exec_engine=exec_engine_config,
         # Data clients
         data_clients={
             "BINANCE": data_config,

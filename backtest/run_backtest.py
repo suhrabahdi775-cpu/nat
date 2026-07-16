@@ -75,6 +75,18 @@ def main():
     parser.add_argument("--partial-tp-levels", default=None,
                         help='Ladder spec "pct:frac,pct:frac", e.g. "0.005:0.5,0.01:0.5" '
                              '= 50%% off at +0.5%%, rest at +1%% (implies --partial-tp on)')
+    parser.add_argument("--breakeven-r", type=float, default=None,
+                        help="Override breakeven_trigger_r (R multiple at which SL moves to entry)")
+    parser.add_argument("--breakeven-lock-r", type=float, default=None,
+                        help="Override breakeven_lock_r (R of profit locked instead of pure breakeven)")
+    parser.add_argument("--max-age-bars", type=int, default=None,
+                        help="Override max_position_age_bars (stagnant-position timeout)")
+    parser.add_argument("--trailing-act", type=float, default=None,
+                        help="Override trailing_activation_pct")
+    parser.add_argument("--hi-conf-reversal", action="store_true", default=False,
+                        help="Require HIGH confidence to reverse an open position")
+    parser.add_argument("--min-er", type=float, default=None,
+                        help="Override min_efficiency_ratio chop gate")
     parser.add_argument("--log-level", default="ERROR", help="Engine log level (ERROR keeps output readable)")
     parser.add_argument("--start", default=None, help="Window start date, e.g. 2026-06-24")
     parser.add_argument("--end", default=None, help="Window end date (exclusive)")
@@ -155,6 +167,12 @@ def main():
         use_account_balance=True,
         **({"risk_per_trade_pct": args.risk_pct} if args.risk_pct is not None else {}),
         **({"max_position_ratio": args.max_ratio} if args.max_ratio is not None else {}),
+        **({"breakeven_trigger_r": args.breakeven_r} if args.breakeven_r is not None else {}),
+        **({"breakeven_lock_r": args.breakeven_lock_r} if args.breakeven_lock_r is not None else {}),
+        **({"max_position_age_bars": args.max_age_bars} if args.max_age_bars is not None else {}),
+        **({"trailing_activation_pct": args.trailing_act} if args.trailing_act is not None else {}),
+        **({"require_high_confidence_for_reversal": True} if args.hi_conf_reversal else {}),
+        **({"min_efficiency_ratio": args.min_er} if args.min_er is not None else {}),
         **({"enable_partial_tp": args.partial_tp == "on"} if args.partial_tp is not None else {}),
         **(
             {
