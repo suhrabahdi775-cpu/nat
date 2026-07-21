@@ -212,6 +212,12 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         reversal_confirmation_signals=get_env_int('REVERSAL_CONFIRMATION_SIGNALS', '2'),
         min_atr_pct_to_trade=get_env_float('MIN_ATR_PCT_TO_TRADE', '0.001'),
         min_efficiency_ratio=get_env_float('MIN_EFFICIENCY_RATIO', '0.25'),
+        # State-desync self-heal: on the reduce-only tripwire, re-query Binance
+        # for the true position and resume, or auto-restart on a confirmed
+        # phantom (needs a supervisor like systemd Restart=always).
+        desync_rest_recovery=get_env_str('DESYNC_REST_RECOVERY', 'true').lower() == 'true',
+        desync_recovery_interval_secs=get_env_float('DESYNC_RECOVERY_INTERVAL_SECS', '60'),
+        auto_restart_on_desync=get_env_str('AUTO_RESTART_ON_DESYNC', 'true').lower() == 'true',
         enable_partial_tp=get_env_str('ENABLE_PARTIAL_TP', 'false').lower() == 'true',
         max_signal_staleness_pct=get_env_float('MAX_SIGNAL_STALENESS_PCT', '0.0015'),
 

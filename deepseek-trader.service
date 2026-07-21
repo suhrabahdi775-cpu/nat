@@ -1,24 +1,62 @@
 [Unit]
-Description=DeepSeek AI Trading Strategy
-After=network.target
+Description=nat
+Documentation=file:///opt/deepseek-trader/README.md
+# Start after the network is truly online, and after Redis if it is used
+# locally for bar persistence. Wants= is a SOFT dependency: the bot still
+# starts if redis-server is not installed.
+After=network-online.target redis-server.service
+Wants=network-online.target
+Wants=redis-server.service
+# If it crash-loops, stop retrying after 5 failures in 5 min so a broken
+# deploy does not hammer the exchange API. Clear with:
+#   systemctl reset-failed deepseek-trader
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/nautilus_deepseek
-Environment="PATH=/home/ubuntu/deepseek_venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-Environment="AUTO_CONFIRM=true"
-EnvironmentFile=-/home/ubuntu/nautilus_deepseek/.env
-ExecStart=/home/ubuntu/deepseek_venv/bin/python /home/ubuntu/nautilus_deepseek/main_live.py
 
-# 自动重启策略
+# --- Run as a dedicated non-root user (create it first, see README below) ---
+User=trader
+Group=trader
+
+# --- Paths: adjust if you install somewhere other than /opt/deepseek-trader ---
+WorkingDirectory=/opt/deepseek-trader
+ExecStart=/opt/deepseek-trader/venv/bin/python /opt/deepseek-trader/main_live.py
+
+# main_live.py calls input() for a confirmation prompt unless this is set.
+# systemd has no TTY, so this MUST be true or the service never starts.
+Environment=AUTO_CONFIRM=true
+# Unbuffered stdout so journalctl shows logs in real time (no 4KB lag).
+Environment=PYTHONUNBUFFERED=1
+# NOTE: all other config (API keys, LEVERAGE, etc.) is read from .env by
+# python-dotenv inside the app. We do NOT use EnvironmentFile= because .env
+# contains inline "# comments" that systemd would parse into the values.
+
+# --- Restart policy: survive crashes and the nightly log rotation ---
 Restart=always
 RestartSec=10
 
-# 日志配置
-StandardOutput=append:/home/ubuntu/nautilus_deepseek/logs/trader.log
-StandardError=append:/home/ubuntu/nautilus_deepseek/logs/trader_error.log
+# --- Graceful shutdown: give NautilusTrader time to flush/cancel on stop ---
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+# --- Logging: to the journal (journalctl -u deepseek-trader). The app also
+# writes its own detailed JSON logs under logs/ regardless. ---
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=deepseek-trader
+
+# --- Security hardening (safe for this workload; loosen if something breaks) ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# The one tree the bot must write to (logs/, trade_history.json, data cache):
+ReadWritePaths=/opt/deepseek-trader
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target
-

@@ -6,8 +6,12 @@ technical indicators for market analysis, and sentiment data for validation.
 """
 
 import os
+import time
+import hmac
+import hashlib
 import asyncio
 import threading
+import requests
 from decimal import Decimal
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -136,6 +140,21 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     # Reversal confirmation: require this many CONSECUTIVE opposite signals
     # before reversing a position (cuts whipsaw churn). 1 = immediate.
     reversal_confirmation_signals: int = 2
+
+    # State-desync self-heal. When the reduce-only tripwire fires (cached
+    # position disagrees with the exchange), actively re-query Binance for the
+    # TRUE position via signed REST instead of waiting for a human restart:
+    #   - exchange agrees with cache      -> transient reject, resume trading
+    #   - exchange flat but cache is open -> phantom the framework cannot heal
+    #     on its own (a flat account sends zero position reports, so Nautilus
+    #     reconciliation never corrects it); auto-restart under the supervisor
+    #     to rebuild the cache from a clean startup reconciliation.
+    desync_rest_recovery: bool = True       # signed-REST truth check while paused
+    desync_recovery_interval_secs: float = 60.0   # min seconds between REST checks
+    # Exit the process on a confirmed phantom so a supervisor (systemd
+    # Restart=always) restarts flat. Requires such a supervisor; if you run
+    # the bot by hand, set this False and restart manually on the alert.
+    auto_restart_on_desync: bool = True
 
     # Dead-market filter: skip NEW entries when ATR as a fraction of price
     # is below this (chop - fees eat any edge). 0 disables.
@@ -392,6 +411,11 @@ class DeepSeekAIStrategy(Strategy):
         # state is live again (continuous reconciliation repairs it).
         self._reduce_reject_streak = 0
         self._state_desync = False
+        # Self-heal config + throttle state (see DeepSeekAIStrategyConfig)
+        self._desync_rest_recovery = config.desync_rest_recovery
+        self._desync_recovery_interval_secs = config.desync_recovery_interval_secs
+        self._auto_restart_on_desync = config.auto_restart_on_desync
+        self._last_desync_recovery_ts = 0.0
 
         # Signal snapshot taken at ENTRY time - the feedback loop must label
         # trades with the signal that opened them, not whatever signal was
@@ -1228,12 +1252,15 @@ class DeepSeekAIStrategy(Strategy):
             return
 
         # State-desync tripwire: cached position provably disagrees with the
-        # exchange - any action would target a fantasy position
+        # exchange - any action would target a fantasy position. Instead of
+        # waiting for a human, actively re-query Binance for the truth and
+        # self-heal (resume, or auto-restart on a confirmed phantom).
         if self._state_desync:
             self.log.error(
-                "🚨 Trading paused (position state desync) - awaiting "
-                "reconciliation or restart"
+                "🚨 Trading paused (position state desync) - attempting "
+                "self-heal via exchange position check"
             )
+            self._attempt_desync_recovery()
             return
         
         # Store signal and technical data for SL/TP calculation
@@ -2004,10 +2031,7 @@ class DeepSeekAIStrategy(Strategy):
         filled_order_id = str(event.client_order_id)
 
         # A real fill proves order flow is live - clear the desync tripwire
-        self._reduce_reject_streak = 0
-        if self._state_desync:
-            self._state_desync = False
-            self.log.info("✅ State desync cleared by a real fill - trading resumed")
+        self._clear_desync("a real fill")
 
         self.log.info(
             f"✅ Order filled: {event.order_side.name} "
@@ -2027,7 +2051,122 @@ class DeepSeekAIStrategy(Strategy):
                 self.telegram_bot.send_message_sync(fill_msg)
             except Exception as e:
                 self.log.warning(f"Failed to send Telegram fill notification: {e}")
-    
+
+
+    def _clear_desync(self, reason: str):
+        """Reset the reduce-only reject streak and lift the desync pause.
+
+        Called from every real fill/position event: any of them proves order
+        or position flow is live and the cache has synced to exchange truth.
+        """
+        self._reduce_reject_streak = 0
+        if self._state_desync:
+            self._state_desync = False
+            self._last_desync_recovery_ts = 0.0
+            self.log.info(f"✅ State desync cleared by {reason} - trading resumed")
+
+    def _fetch_exchange_position_amt(self) -> Optional[float]:
+        """Signed Binance-USDM query for the TRUE net position of the symbol.
+
+        Returns the signed positionAmt (positive long, negative short, 0.0
+        flat), or None if the query could not be completed. Read-only - it
+        never places or cancels an order.
+        """
+        api_key = os.getenv('BINANCE_API_KEY')
+        api_secret = os.getenv('BINANCE_API_SECRET')
+        if not api_key or not api_secret:
+            self.log.warning("Desync recovery: BINANCE_API_KEY/SECRET not set - cannot query truth")
+            return None
+        try:
+            symbol = self.instrument_id.symbol.value.replace('-PERP', '').replace('-', '')
+            ts = int(time.time() * 1000)
+            query = f"symbol={symbol}&timestamp={ts}&recvWindow=5000"
+            sig = hmac.new(api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+            resp = requests.get(
+                f"https://fapi.binance.com/fapi/v2/positionRisk?{query}&signature={sig}",
+                headers={'X-MBX-APIKEY': api_key},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            amt = sum(float(p.get('positionAmt', 0.0)) for p in data if p.get('symbol') == symbol)
+            return amt
+        except Exception as e:
+            self.log.warning(f"Desync recovery: position query failed ({e}) - will retry")
+            return None
+
+    def _attempt_desync_recovery(self):
+        """Self-heal a paused-on-desync bot by checking Binance ground truth.
+
+        Runs while `_state_desync` is set, throttled to one REST check per
+        `desync_recovery_interval_secs`. Outcomes:
+          * exchange agrees with cache  -> transient reject, resume.
+          * exchange flat, cache open   -> confirmed phantom the framework
+            cannot self-heal; auto-restart under the supervisor (if enabled)
+            to rebuild the cache from a clean startup reconciliation.
+          * ambiguous mismatch / query fails -> stay paused, keep alerting.
+        """
+        if not self._desync_rest_recovery:
+            return
+        now = time.time()
+        if now - self._last_desync_recovery_ts < self._desync_recovery_interval_secs:
+            return
+        self._last_desync_recovery_ts = now
+
+        amt = self._fetch_exchange_position_amt()
+        if amt is None:
+            return  # query failed - remain paused, try again next interval
+
+        cached = self.cache.positions_open(instrument_id=self.instrument_id) if self.cache else []
+        cached_qty = float(cached[0].signed_qty) if cached else 0.0
+        FLAT = 1e-9
+
+        # Both sides agree (flat/flat or same signed size within a lot) -> the
+        # rejects were a transient sync lag; the cache is fine, just resume.
+        if abs(amt - cached_qty) < 1e-4:
+            self._clear_desync(f"exchange confirmed position {amt:+.6f} matches cache")
+            return
+
+        if abs(amt) < FLAT and abs(cached_qty) > FLAT:
+            # Confirmed phantom: exchange flat, cache still shows a position.
+            self.log.error(
+                f"🚨 Desync confirmed via REST: exchange FLAT but cache holds "
+                f"{cached_qty:+.6f}. The framework cannot heal this (a flat "
+                f"account sends no position report)."
+            )
+            # Cancel any orphaned protection orders left on the exchange first.
+            try:
+                self.cancel_all_orders(self.instrument_id)
+            except Exception:
+                pass
+            if self.telegram_bot and self.enable_telegram:
+                try:
+                    self.telegram_bot.send_message_sync(
+                        "🩺 Auto-recovery: exchange is flat but bot held a phantom "
+                        "position. Restarting to rebuild state from the exchange."
+                    )
+                except Exception:
+                    pass
+            if self._auto_restart_on_desync:
+                self.log.error(
+                    "🔁 Auto-restart: exiting so the supervisor restarts the bot "
+                    "flat (startup reconciliation rebuilds the cache). Set "
+                    "auto_restart_on_desync=False to disable."
+                )
+                os._exit(70)  # EX_SOFTWARE; systemd Restart=always brings it back
+            else:
+                self.log.error(
+                    "auto_restart_on_desync=False - staying paused. Restart the "
+                    "bot manually to clear the phantom position."
+                )
+            return
+
+        # Non-flat mismatch (exchange has a DIFFERENT real position): do not
+        # gamble on automated repair - keep paused and keep alerting loudly.
+        self.log.error(
+            f"🚨 Desync: exchange position {amt:+.6f} disagrees with cache "
+            f"{cached_qty:+.6f} - staying paused (manual review needed)"
+        )
 
     def on_order_rejected(self, event):
         """Handle order rejected events."""
@@ -2078,6 +2217,10 @@ class DeepSeekAIStrategy(Strategy):
         Note: With bracket orders, SL/TP orders are automatically submitted as part of the bracket.
         We no longer need to manually submit them here.
         """
+        # A position event proves the position stream/reconciliation is live
+        # and the cache just synced to exchange truth - safe to resume.
+        self._clear_desync("a position-opened event")
+
         # PositionOpened event contains position data directly
         self.log.info(
             f"🟢 Position opened: {event.side.name} "
@@ -2157,6 +2300,9 @@ class DeepSeekAIStrategy(Strategy):
            the stop-loss to the remaining quantity via modify_order,
            leaving the rest of the TP ladder untouched.
         """
+        # A position event proves order/position flow is live - resume trading.
+        self._clear_desync("a position-changed event")
+
         if self._pending_protection_refresh:
             self._pending_protection_refresh = False
             try:
@@ -2357,6 +2503,10 @@ class DeepSeekAIStrategy(Strategy):
 
     def on_position_closed(self, event):
         """Handle position closed events."""
+        # A close event (incl. one from reconciliation) resyncs the cache to
+        # flat - clear the desync tripwire so trading resumes automatically.
+        self._clear_desync("a position-closed event")
+
         realized_pnl = float(event.realized_pnl)
         self.log.info(
             f"🔴 Position closed: {event.side.name} "
