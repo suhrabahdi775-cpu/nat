@@ -210,6 +210,11 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         loss_streak_threshold=get_env_int('LOSS_STREAK_THRESHOLD', '2'),
         max_position_age_bars=get_env_int('MAX_POSITION_AGE_BARS', '48'),
         reversal_confirmation_signals=get_env_int('REVERSAL_CONFIRMATION_SIGNALS', '2'),
+        # Anti-churn + exhaustion gates (post-mortem 2026-07-22/23: all 4
+        # trades lost - naked-SL race, size churn, exhaustion-chase entries)
+        allow_position_adds=get_env_str('ALLOW_POSITION_ADDS', 'true').lower() == 'true',
+        rsi_entry_gate_upper=get_env_float('RSI_ENTRY_GATE_UPPER', '70'),
+        rsi_entry_gate_lower=get_env_float('RSI_ENTRY_GATE_LOWER', '30'),
         min_atr_pct_to_trade=get_env_float('MIN_ATR_PCT_TO_TRADE', '0.001'),
         min_efficiency_ratio=get_env_float('MIN_EFFICIENCY_RATIO', '0.25'),
         # State-desync self-heal: on the reduce-only tripwire, re-query Binance

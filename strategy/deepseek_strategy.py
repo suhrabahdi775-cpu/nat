@@ -141,6 +141,20 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     # before reversing a position (cuts whipsaw churn). 1 = immediate.
     reversal_confirmation_signals: int = 2
 
+    # Adds to an open position re-price risk mid-trade; live 2026-07-23 they
+    # churned fees via 1-lot flapping every cycle. The 25% dead-band + 4-bar
+    # adjustment cooldown bounds that (verified: blocks the observed live
+    # churn), and with the hysteresis in place adds are backtest-positive
+    # (+3.5 USDT / 6.5mo), so they stay enabled. Set False to hard-block.
+    allow_position_adds: bool = True
+
+    # Exhaustion gate: skip NEW longs when RSI is above upper / NEW shorts
+    # when RSI is below lower, unless the signal is HIGH confidence. All 4
+    # live losses 2026-07-22/23 were entries chasing an extended move
+    # (long at RSI 71.8 top; shorts at RSI<30 lows). 0 disables.
+    rsi_entry_gate_upper: float = 70.0
+    rsi_entry_gate_lower: float = 30.0
+
     # State-desync self-heal. When the reduce-only tripwire fires (cached
     # position disagrees with the exchange), actively re-query Binance for the
     # TRUE position via signed REST instead of waiting for a human restart:
@@ -373,6 +387,10 @@ class DeepSeekAIStrategy(Strategy):
 
         # Reversal confirmation
         self.reversal_confirmation_signals = config.reversal_confirmation_signals
+        self.allow_position_adds = config.allow_position_adds
+        self.rsi_entry_gate_upper = config.rsi_entry_gate_upper
+        self.rsi_entry_gate_lower = config.rsi_entry_gate_lower
+        self._last_adjustment_bar = -10**9  # no adjustment yet
         self._opposite_signal_streak = 0
 
         # Dead-market filter
@@ -1003,6 +1021,15 @@ class DeepSeekAIStrategy(Strategy):
             self.log.error(f"Failed to get technical data: {e}")
             return
 
+        # POSITION MAINTENANCE - runs BEFORE the DeepSeek call so a slow or
+        # failing AI API can never leave an open position unmanaged (the
+        # except-path below returns early; maintenance must not sit behind it).
+        if self.enable_trailing_stop:
+            self._update_trailing_stops(current_price)
+        self._ensure_position_protected()
+        if self.max_position_age_bars > 0:
+            self._check_stale_position()
+
         # Get K-line data
         kline_data = self.indicator_manager.get_kline_data(count=10)
         self.log.debug(f"Retrieved {len(kline_data)} K-lines for analysis")
@@ -1123,22 +1150,57 @@ class DeepSeekAIStrategy(Strategy):
         # Store signal
         self.last_signal = signal_data
 
+        # Orphan-order safety net - runs BEFORE trade execution. Running it
+        # after killed every trade's protection at birth: the entry MARKET
+        # fill arrives ~6s later via polling, so positions_open() was still
+        # empty when cleanup saw the just-submitted bracket's reduce-only
+        # SL/TP legs and cancelled them as "orphans" (live 2026-07-22: T1 ran
+        # 5.5h with no stop, -10.23 = 2x sized risk).
+        self._cleanup_oco_orphans()
+
         # Execute trade
         self._execute_trade(signal_data, price_data, technical_data, current_position)
-        
-        # Orphan-order safety net. (Was gated on the deprecated oco_manager,
-        # which is always None - meaning this never ran. Primary cleanup is
-        # event-driven in on_position_closed; this catches edge cases like
-        # fills that arrive during a disconnect.)
-        self._cleanup_oco_orphans()
-        
-        # Trailing stop maintenance: check and update trailing stops
-        if self.enable_trailing_stop:
-            self._update_trailing_stops(price_data['price'])
 
-        # Stagnant position exit: cut positions that go nowhere
-        if self.max_position_age_bars > 0:
-            self._check_stale_position()
+        # (Trailing / failsafe / stagnant maintenance now runs BEFORE the
+        # DeepSeek call in _run_analysis, so an AI failure can't skip it.)
+
+    def _ensure_position_protected(self):
+        """Rebuild SL/TP if an open position has no working reduce-only order.
+
+        Uses the tracked bracket prices when available; falls back to an
+        emergency stop at max_sl_pct from the position's average entry so the
+        worst case is always bounded.
+        """
+        try:
+            positions = self.cache.positions_open(instrument_id=self.instrument_id)
+            if not positions:
+                return
+            if any(o.is_reduce_only for o in self._working_orders()):
+                return  # protection present
+
+            position = positions[0]
+            self.log.error(
+                f"🚨 NAKED POSITION: {position.side.name} "
+                f"{float(position.quantity):.3f} BTC has no working SL/TP - "
+                f"rebuilding protection"
+            )
+            if self.position_protection.get('sl_price') and self.position_protection.get('tp_price'):
+                self._refresh_protection_orders()
+                return
+
+            # No tracked prices (e.g. adopted/external position): emergency
+            # stop at max_sl_pct from average entry, TP at min_risk_reward x.
+            entry = float(position.avg_px_open)
+            if position.side == PositionSide.LONG:
+                sl = entry * (1 - self.max_sl_pct)
+                tp = entry * (1 + self.max_sl_pct * self.min_risk_reward)
+            else:
+                sl = entry * (1 + self.max_sl_pct)
+                tp = entry * (1 - self.max_sl_pct * self.min_risk_reward)
+            self.position_protection = {'sl_price': sl, 'tp_price': tp}
+            self._refresh_protection_orders()
+        except Exception as e:
+            self.log.error(f"❌ ensure_position_protected failed: {e}")
 
     def _check_stale_position(self):
         """
@@ -1331,6 +1393,26 @@ class DeepSeekAIStrategy(Strategy):
                 self.log.info(
                     f"🌀 Choppy market: efficiency ratio {er:.2f} < "
                     f"{self.min_efficiency_ratio:.2f} - skipping entry"
+                )
+                return
+
+        # Exhaustion gate: don't chase an extended move. Longs blocked at
+        # overbought RSI, shorts at oversold, unless HIGH confidence (all 4
+        # live losses 2026-07-22/23 were exhaustion chases).
+        if current_position is None and confidence != 'HIGH':
+            rsi = technical_data.get('rsi', 50.0) or 50.0
+            if (
+                signal == 'BUY'
+                and self.rsi_entry_gate_upper > 0
+                and rsi > self.rsi_entry_gate_upper
+            ) or (
+                signal == 'SELL'
+                and self.rsi_entry_gate_lower > 0
+                and rsi < self.rsi_entry_gate_lower
+            ):
+                self.log.info(
+                    f"🥵 Exhaustion gate: RSI {rsi:.1f} too extended for "
+                    f"{signal} at {confidence} confidence - skipping entry"
                 )
                 return
 
@@ -1604,7 +1686,15 @@ class DeepSeekAIStrategy(Strategy):
             self._opposite_signal_streak = 0
 
             size_diff = target_quantity - current_qty
-            threshold = self.position_config['adjustment_threshold']
+            # Relative dead-band: the old absolute 0.001 threshold equalled
+            # ONE lot step, so confidence/RSI-multiplier flapping re-sized
+            # the position every 15-min cycle (live 2026-07-23: 4 resize
+            # fills in 90min, pure fee bleed + worse avg price). Only adjust
+            # on a change worth at least 25% of the current position.
+            threshold = max(
+                self.position_config['adjustment_threshold'],
+                0.25 * current_qty,
+            )
 
             if abs(size_diff) < threshold:
                 self.log.info(
@@ -1612,10 +1702,31 @@ class DeepSeekAIStrategy(Strategy):
                 )
                 return
 
+            # Hysteresis: at most one size adjustment per 4 bars - resizing
+            # is maintenance, not signal-chasing.
+            bars_since_adj = self.bars_received - self._last_adjustment_bar
+            if bars_since_adj < 4:
+                self.log.info(
+                    f"⏸️ Size adjustment suppressed ({bars_since_adj} bars since "
+                    f"last, need 4) - target {target_quantity:.3f} vs current {current_qty:.3f}"
+                )
+                return
+
             if size_diff > 0:
+                # Adds re-price risk mid-trade while bypassing every entry
+                # gate (chop ER, staleness, cooldown), and re-average the
+                # entry worse - live losses T3/T4. Disabled unless explicitly
+                # enabled; reduces stay allowed (they only cut risk).
+                if not self.allow_position_adds:
+                    self.log.info(
+                        f"🚫 Position add blocked (allow_position_adds=false): "
+                        f"{current_qty:.3f} → {target_quantity:.3f} BTC skipped"
+                    )
+                    return
                 # Add to position - protection orders re-synced to the new
                 # quantity in on_position_changed (via refresh flag)
                 self._pending_protection_refresh = True
+                self._last_adjustment_bar = self.bars_received
                 self._submit_order(
                     side=OrderSide.BUY if target_side == 'long' else OrderSide.SELL,
                     quantity=abs(size_diff),
@@ -1628,6 +1739,7 @@ class DeepSeekAIStrategy(Strategy):
             else:
                 # Reduce position - protection orders re-synced likewise
                 self._pending_protection_refresh = True
+                self._last_adjustment_bar = self.bars_received
                 self._submit_order(
                     side=OrderSide.SELL if target_side == 'long' else OrderSide.BUY,
                     quantity=abs(size_diff),
@@ -2521,7 +2633,10 @@ class DeepSeekAIStrategy(Strategy):
 
         # Cooldown after a losing trade - avoid immediate revenge re-entry
         if realized_pnl < 0 and self.loss_cooldown_bars > 0:
-            self.cooldown_until_bar = self.bars_received + self.loss_cooldown_bars
+            # +1: the close lands mid-bar, so without it a "2 bar" cooldown
+            # only blocked ONE analysis cycle (verified live 2026-07-22:
+            # stop-out 05:54, opposite entry 06:39 = next-but-one cycle).
+            self.cooldown_until_bar = self.bars_received + self.loss_cooldown_bars + 1
             self.log.info(
                 f"🧊 Loss cooldown active for the next "
                 f"{self.loss_cooldown_bars} bars"
@@ -2589,9 +2704,32 @@ class DeepSeekAIStrategy(Strategy):
                 open_orders = self._working_orders()
 
                 if open_orders:
+                    # GUARD 1: an ENTRY order (non-reduce-only) still pending
+                    # means a bracket was just submitted and its market entry
+                    # has not filled yet (fills arrive ~6s later via polling).
+                    # The reduce-only SL/TP legs are NOT orphans - they are
+                    # the newborn position's protection. Skip entirely.
+                    entry_pending = any(
+                        not o.is_reduce_only and not o.is_closed
+                        for o in open_orders
+                    )
+                    if entry_pending:
+                        self.log.debug(
+                            "Orphan cleanup skipped: entry order in flight "
+                            "(bracket legs are not orphans)"
+                        )
+                        return
+
                     orphan_count = 0
                     for order in open_orders:
                         if order.is_reduce_only:
+                            # GUARD 2: a leg whose parent (the bracket entry)
+                            # is still working is contingent, not orphaned.
+                            parent_id = getattr(order, 'parent_order_id', None)
+                            if parent_id is not None:
+                                parent = self.cache.order(parent_id)
+                                if parent is not None and not parent.is_closed:
+                                    continue
                             # This is a reduce-only order without a position - orphan!
                             try:
                                 self.cancel_order(order)

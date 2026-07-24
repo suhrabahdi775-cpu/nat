@@ -87,6 +87,10 @@ def main():
                         help="Require HIGH confidence to reverse an open position")
     parser.add_argument("--min-er", type=float, default=None,
                         help="Override min_efficiency_ratio chop gate")
+    parser.add_argument("--allow-adds", action="store_true", default=False,
+                        help="Allow adds to an open position (default: blocked)")
+    parser.add_argument("--rsi-gate", type=float, nargs=2, metavar=("UP","LO"), default=None,
+                        help="RSI exhaustion gate thresholds, 0 0 disables")
     parser.add_argument("--log-level", default="ERROR", help="Engine log level (ERROR keeps output readable)")
     parser.add_argument("--start", default=None, help="Window start date, e.g. 2026-06-24")
     parser.add_argument("--end", default=None, help="Window end date (exclusive)")
@@ -173,6 +177,8 @@ def main():
         **({"trailing_activation_pct": args.trailing_act} if args.trailing_act is not None else {}),
         **({"require_high_confidence_for_reversal": True} if args.hi_conf_reversal else {}),
         **({"min_efficiency_ratio": args.min_er} if args.min_er is not None else {}),
+        **({"allow_position_adds": True} if args.allow_adds else {}),
+        **({"rsi_entry_gate_upper": args.rsi_gate[0], "rsi_entry_gate_lower": args.rsi_gate[1]} if args.rsi_gate else {}),
         **({"enable_partial_tp": args.partial_tp == "on"} if args.partial_tp is not None else {}),
         **(
             {
